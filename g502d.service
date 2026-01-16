@@ -1,0 +1,10 @@
+[Unit]
+Description=G502 Daemon
+
+[Service]
+ExecStart=%h/.local/bin/g502d
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
