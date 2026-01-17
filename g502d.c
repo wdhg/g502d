@@ -75,48 +75,84 @@ void* mouse_thread_io_func(void* args_void) {
 	float accum_x = 0.0;
 	float accum_y = 0.0;
 	
+	const size_t ev_size = sizeof(struct input_event);
+
 	// Read events in a loop
 	while (1) {
-		struct input_event ev;
-		ssize_t n = read(mouse_fd, &ev, sizeof(ev));
-		if (n != sizeof(ev)) {
+		// Read an event
+		struct input_event ev = {0};
+		ssize_t n = read(mouse_fd, &ev, ev_size);
+		if (n != ev_size) {
 			fprintf(stderr, "Failed to read mouse event\n");
 			continue;
 		}
 
-		// Process the mouse event here
-		if (ev.type == EV_KEY) {
-			// Map side buttons to keyboard modifiers
-			if (ev.code == BTN_SIDE) {
-				// Map to left shift
-				struct input_event kb_ev = ev;
-				kb_ev.code = KEY_LEFTSHIFT;
-				send_input_event_to_keyboard(&kb_ev);
-				continue; // Do not forward the original event
-			} else if (ev.code == BTN_EXTRA) {
-				// Map to left ctrl
-				struct input_event kb_ev = ev;
-				kb_ev.code = KEY_LEFTCTRL;
-				send_input_event_to_keyboard(&kb_ev);
-				continue; // Do not forward the original event
-			}
-		} else if (ev.type == EV_REL) {
-			// Scale mouse movement
-			if (ev.code == REL_X) {
-				accum_x += ev.value * DPI_SCALE;
-				int int_move = (int)roundf(accum_x);
-				accum_x -= int_move;
-				ev.value = int_move;
-			} else if (ev.code == REL_Y) {
-				accum_y += ev.value * DPI_SCALE;
-				int int_move = (int)roundf(accum_y);
-				accum_y -= int_move;
-				ev.value = int_move;
-			}
+		switch (ev.type)
+		{
+			case EV_KEY:
+			{
+				// Only send side buttons to keyboard, forward others to mouse
+				if (ev.code == BTN_SIDE || ev.code == BTN_EXTRA) {
+					// Convert side buttons to modifier keys
+					if      (ev.code == BTN_SIDE) ev.code = KEY_LEFTSHIFT;
+					else if (ev.code == BTN_EXTRA) ev.code = KEY_LEFTCTRL;
+					send_input_event_to_keyboard(&ev);
+				} else {
+					write(args->out_fd, &ev, ev_size);
+				}
+			} break;
+			case EV_REL:
+			{
+				// Scale mouse movement
+				if (ev.code == REL_X) {
+					accum_x += ev.value * DPI_SCALE;
+					int int_move = (int)roundf(accum_x);
+					accum_x -= int_move;
+					ev.value = int_move;
+				} else if (ev.code == REL_Y) {
+					accum_y += ev.value * DPI_SCALE;
+					int int_move = (int)roundf(accum_y);
+					accum_y -= int_move;
+					ev.value = int_move;
+				}
+				write(args->out_fd, &ev, ev_size);
+			} break;
+			case EV_MSC:
+			{
+				if (ev.code == MSC_SCAN)
+				{
+					if (ev.value == 0x90004)
+					{
+						ev.value = 0x70004;
+						send_input_event_to_keyboard(&ev);
+					}
+					else if (ev.value == 0x90005)
+					{
+						ev.value = 0x70005;
+						send_input_event_to_keyboard(&ev);
+					}
+					else
+					{
+						write(args->out_fd, &ev, ev_size);
+					}
+				}
+				else
+				{
+					write(args->out_fd, &ev, ev_size);
+				}
+			} break;
+			case EV_SYN:
+			{
+				// Write event to both buffers
+				send_input_event_to_keyboard(&ev);
+				write(args->out_fd, &ev, ev_size);
+			} break;
+			default:
+			{
+				// Forward other events to mouse
+				write(args->out_fd, &ev, ev_size);
+			} break;
 		}
-
-		// Forward the event to the virtual mouse device
-		write(args->out_fd, &ev, sizeof(ev));
 	}
 
 	// Release the mouse device
@@ -312,7 +348,7 @@ int main()
 
 
 	// Then the virtual keyboard device
-	int v_kb_fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
+	int v_kb_fd = open("/dev/uinput", O_WRONLY);
 	if (v_kb_fd < 0)
 	{
 		fprintf(stderr, "Failed to open /dev/uinput for virtual keyboard\n");
@@ -327,6 +363,9 @@ int main()
 	{
 		ioctl(v_kb_fd, UI_SET_KEYBIT, code);
 	}
+	// Enable MSC events for scan codes
+	ioctl(v_kb_fd, UI_SET_EVBIT, EV_MSC);
+	ioctl(v_kb_fd, UI_SET_MSCBIT, MSC_SCAN);
 	struct uinput_setup v_kb_setup = {
 		.id = {
 			.bustype = BUS_USB,
