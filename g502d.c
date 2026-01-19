@@ -44,14 +44,17 @@ static void send_input_event_to_keyboard(struct input_event* ev) {
 	size_t next_head = (head + 1) % EVENT_BUFFER_SIZE;
 	if (next_head == tail) {
 		// Buffer is full, drop the event
-		fprintf(stderr, "Keyboard event buffer full, dropping event\n");
+		fprintf(stderr, "Keyboard event buffer full, dropping event (type=%d, code=%d, value=%d)\n",
+			ev->type, ev->code, ev->value);
 		return;
 	}
 	kb_event_buffer[head] = *ev;
 	head = next_head;
 
 	// Signal that a new event is available
-	sem_post(&kb_event_sem);
+	if (sem_post(&kb_event_sem) != 0) {
+		fprintf(stderr, "sem_post failed when sending keyboard event\n");
+	}
 }
 
 // Thread that will handle mouse INPUT and OUTPUT events
@@ -69,7 +72,9 @@ void* mouse_thread_io_func(void* args_void) {
 		pthread_exit(NULL);
 	}
 	// Capture events
-	ioctl(mouse_fd, EVIOCGRAB, 1);
+	if (ioctl(mouse_fd, EVIOCGRAB, 1) < 0) {
+		fprintf(stderr, "Failed to grab mouse event device\n");
+	}
 
 	// Accumulators for scaled movement
 	float accum_x = 0.0;
@@ -98,7 +103,10 @@ void* mouse_thread_io_func(void* args_void) {
 					else if (ev.code == BTN_EXTRA) ev.code = KEY_LEFTCTRL;
 					send_input_event_to_keyboard(&ev);
 				} else {
-					write(args->out_fd, &ev, ev_size);
+					ssize_t written = write(args->out_fd, &ev, ev_size);
+					if (written != ev_size) {
+						fprintf(stderr, "Failed to write mouse button event: wrote %zd/%zu bytes\n", written, ev_size);
+					}
 				}
 			} break;
 			case EV_REL:
@@ -115,7 +123,10 @@ void* mouse_thread_io_func(void* args_void) {
 					accum_y -= int_move;
 					ev.value = int_move;
 				}
-				write(args->out_fd, &ev, ev_size);
+				ssize_t written = write(args->out_fd, &ev, ev_size);
+				if (written != ev_size) {
+					fprintf(stderr, "Failed to write mouse REL event: wrote %zd/%zu bytes\n", written, ev_size);
+				}
 			} break;
 			case EV_MSC:
 			{
@@ -133,24 +144,37 @@ void* mouse_thread_io_func(void* args_void) {
 					}
 					else
 					{
-						write(args->out_fd, &ev, ev_size);
+						ssize_t written = write(args->out_fd, &ev, ev_size);
+						if (written != ev_size) {
+							fprintf(stderr, "Failed to write mouse MSC scan event: wrote %zd/%zu bytes\n", written, ev_size);
+						}
 					}
 				}
 				else
 				{
-					write(args->out_fd, &ev, ev_size);
+					ssize_t written = write(args->out_fd, &ev, ev_size);
+					if (written != ev_size) {
+						fprintf(stderr, "Failed to write mouse MSC event: wrote %zd/%zu bytes\n", written, ev_size);
+					}
 				}
 			} break;
 			case EV_SYN:
 			{
 				// Write event to both buffers
 				send_input_event_to_keyboard(&ev);
-				write(args->out_fd, &ev, ev_size);
+				ssize_t written = write(args->out_fd, &ev, ev_size);
+				if (written != ev_size) {
+					fprintf(stderr, "Failed to write mouse SYN event: wrote %zd/%zu bytes\n", written, ev_size);
+				}
 			} break;
 			default:
 			{
 				// Forward other events to mouse
-				write(args->out_fd, &ev, ev_size);
+				ssize_t written = write(args->out_fd, &ev, ev_size);
+				if (written != ev_size) {
+					fprintf(stderr, "Failed to write mouse event (type=%d, code=%d): wrote %zd/%zu bytes\n", 
+						ev.type, ev.code, written, ev_size);
+				}
 			} break;
 		}
 	}
@@ -177,7 +201,9 @@ void* keyboard_process_i(void* args_void) {
 		pthread_exit(NULL);
 	}
 	// Capture events
-	ioctl(kb_fd, EVIOCGRAB, 1);
+	if (ioctl(kb_fd, EVIOCGRAB, 1) < 0) {
+		fprintf(stderr, "Failed to grab keyboard event device\n");
+	}
 
 	// Read events in a loop
 	while (1) {
@@ -208,14 +234,21 @@ void* keyboard_process_o(void* args_void) {
 	// Write events in a loop
 	while (1) {
 		// Wait for an event to be available
-		sem_wait(&kb_event_sem);
+		if (sem_wait(&kb_event_sem) != 0) {
+			fprintf(stderr, "sem_wait failed in keyboard output thread\n");
+			continue;
+		}
 
 		// Get the next event from the buffer
 		struct input_event ev = kb_event_buffer[tail];
 		tail = (tail + 1) % EVENT_BUFFER_SIZE;
 
 		// Forward the event to the virtual keyboard device
-		write(args->out_fd, &ev, sizeof(ev));
+		ssize_t written = write(args->out_fd, &ev, sizeof(ev));
+		if (written != sizeof(ev)) {
+			fprintf(stderr, "Failed to write keyboard event (type=%d, code=%d, value=%d): wrote %zd/%zu bytes\n",
+				ev.type, ev.code, ev.value, written, sizeof(ev));
+		}
 	}
 
 	pthread_exit(NULL);
@@ -381,7 +414,10 @@ int main()
 
 
 	// Initialize semaphore for keyboard event buffer
-	sem_init(&kb_event_sem, 0, 0);
+	if (sem_init(&kb_event_sem, 0, 0) != 0) {
+		fprintf(stderr, "Failed to initialize semaphore\n");
+		return 1;
+	}
 
 
 	// Start keyboard OUTPUT thread
