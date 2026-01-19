@@ -234,7 +234,7 @@ int main()
 	// Disable stdout buffering for real-time logging.
 	setvbuf(stdout, NULL, _IONBF, 0);
 
-	printf("Starting G502 daemon...\n");
+	fprintf(stderr, "Starting G502 daemon...\n");
 	sleep(1);
 
 
@@ -273,7 +273,7 @@ int main()
 
 	sd_device_get_devname(device, (const char**)&g502_event_device_path);
 	g502_event_device_path = strdup(g502_event_device_path); // Duplicate the string to avoid issues later
-	printf("G502 device found: %s\n", g502_event_device_path);
+	fprintf(stderr, "G502 device found: %s\n", g502_event_device_path);
 	sd_device_enumerator_unref(enumerator);
 
 
@@ -303,7 +303,7 @@ int main()
 
 	sd_device_get_devname(device, (const char**)&keyboard_event_device_path);
 	keyboard_event_device_path = strdup(keyboard_event_device_path); // Duplicate the string to avoid issues later
-	printf("Keyboard device found: %s\n", keyboard_event_device_path);
+	fprintf(stderr, "Keyboard device found: %s\n", keyboard_event_device_path);
 	sd_device_enumerator_unref(enumerator);
 
 
@@ -342,7 +342,7 @@ int main()
 	};
 	ioctl(v_g502_fd, UI_DEV_SETUP, &v_g502_setup);
 	ioctl(v_g502_fd, UI_DEV_CREATE);
-	printf("Virtual G502 device created\n");
+	fprintf(stderr, "Virtual G502 device created\n");
 
 
 
@@ -376,7 +376,7 @@ int main()
 	};
 	ioctl(v_kb_fd, UI_DEV_SETUP, &v_kb_setup);
 	ioctl(v_kb_fd, UI_DEV_CREATE);
-	printf("Virtual keyboard device created\n");
+	fprintf(stderr, "Virtual keyboard device created\n");
 
 
 
