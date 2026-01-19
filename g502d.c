@@ -348,7 +348,7 @@ int main()
 
 
 	// Then the virtual keyboard device
-	int v_kb_fd = open("/dev/uinput", O_WRONLY);
+	int v_kb_fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
 	if (v_kb_fd < 0)
 	{
 		fprintf(stderr, "Failed to open /dev/uinput for virtual keyboard\n");
