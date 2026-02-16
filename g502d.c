@@ -10,70 +10,219 @@
       Mouse event device --*               *--> Virtual mouse device
 */
 
+#include <errno.h>
 #include <fcntl.h>
 #include <libevdev/libevdev-uinput.h>
 #include <libevdev/libevdev.h>
 #include <linux/input-event-codes.h>
 #include <linux/input.h>
 #include <linux/uinput.h>
+#include <math.h>
+#include <pthread.h>
+#include <semaphore.h>
+#include <stdatomic.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <systemd/sd-device.h>
 #include <unistd.h>
-#include <semaphore.h>
-#include <pthread.h>
-#include <stdatomic.h>
-#include <math.h>
 
 #include "config.h"
+
+// Magic scan codes for mouse side buttons
+#define SCAN_BTN_SIDE  0x90004
+#define SCAN_BTN_EXTRA 0x90005
+#define SCAN_KEY_SHIFT 0x70004
+#define SCAN_KEY_CTRL  0x70005
+
+// Helper function to get errno string
+static const char* get_errno_name(int err) {
+	switch (err) {
+		case EBADF: return "EBADF (Bad file descriptor)";
+		case ENODEV: return "ENODEV (No such device)";
+		case EINTR: return "EINTR (Interrupted)";
+		case EIO: return "EIO (I/O error)";
+		case EAGAIN: return "EAGAIN (Would block)";
+		case ENOENT: return "ENOENT (No such file)";
+		case EACCES: return "EACCES (Permission denied)";
+		default: return "UNKNOWN";
+	}
+}
+
+// Helper function to check if file descriptor is valid
+static int is_fd_valid(int fd) {
+	return fcntl(fd, F_GETFD) >= 0;
+}
+
+// Helper function to find event device by vendor and model IDs
+static char* find_event_device(const char* vendor_id, const char* model_id, const char* device_name) {
+	struct sd_device_enumerator *enumerator = NULL;
+	int r = sd_device_enumerator_new(&enumerator);
+	if (r < 0) {
+		fprintf(stderr, "Failed to create device enumerator for %s\n", device_name);
+		return NULL;
+	}
+
+	sd_device_enumerator_add_match_subsystem(enumerator, "input", 1);
+	sd_device_enumerator_add_match_sysname(enumerator, "event*");
+	sd_device_enumerator_add_match_property(enumerator, "ID_USB_VENDOR_ID", vendor_id);
+	sd_device_enumerator_add_match_property(enumerator, "ID_MODEL_ID", model_id);
+
+	sd_device *device = sd_device_enumerator_get_device_first(enumerator);
+	if (!device) {
+		fprintf(stderr, "%s device not found\n", device_name);
+		sd_device_enumerator_unref(enumerator);
+		return NULL;
+	}
+
+	const char* device_path = NULL;
+	sd_device_get_devname(device, &device_path);
+	char* result = strdup(device_path);
+	sd_device_enumerator_unref(enumerator);
+	
+	fprintf(stderr, "%s device found: %s\n", device_name, result);
+	return result;
+}
+
+// Helper function to open and grab an input device
+static int open_and_grab_device(const char* device_path, const char* device_name) {
+	int fd = open(device_path, O_RDONLY);
+	if (fd < 0) {
+		fprintf(stderr, "Failed to open %s device: %s\n", device_name, device_path);
+		return -1;
+	}
+	
+	if (ioctl(fd, EVIOCGRAB, 1) < 0) {
+		fprintf(stderr, "Failed to grab %s device\n", device_name);
+		close(fd);
+		return -1;
+	}
+	
+	return fd;
+}
+
+// Helper function to find, open and grab an input device by vendor and model IDs
+static int find_open_and_grab_device(const char* vendor_id, const char* model_id, const char* device_name) {
+	char* device_path = find_event_device(vendor_id, model_id, device_name);
+	if (!device_path) {
+		return -1;
+	}
+	
+	int fd = open_and_grab_device(device_path, device_name);
+	free(device_path);
+	
+	return fd;
+}
+
+// Helper function to release and close device
+static void release_and_close_device(int fd, const char* device_name) {
+	if (fd >= 0) {
+		ioctl(fd, EVIOCGRAB, 0);
+		close(fd);
+		fprintf(stderr, "Released and closed %s device (fd=%d)\n", device_name, fd);
+	}
+}
+
+// Helper function to reopen device with retry logic
+static int reopen_device(int* fd, const char* vendor_id, const char* model_id, const char* device_name) {
+	fprintf(stderr, "%s fd appears invalid, attempting to reopen device\n", device_name);
+	
+	// Release and close old fd
+	release_and_close_device(*fd, device_name);
+	*fd = -1;
+	
+	// Wait a bit before reopening
+	sleep(1);
+	
+	// Try to find and reopen device
+	*fd = find_open_and_grab_device(vendor_id, model_id, device_name);
+	if (*fd < 0) {
+		fprintf(stderr, "Failed to reopen %s device, will retry\n", device_name);
+		return -1;
+	}
+	
+	fprintf(stderr, "Successfully reopened and grabbed %s device\n", device_name);
+	return 0;
+}
 
 // Shared variables for inter-process communication
 sem_t kb_event_sem;
 
 // Ring buffer for keyboard events
 // The indices are atomic for weakly ordered architectures (e.g. ARM)
-#define EVENT_BUFFER_SIZE 256
-struct input_event kb_event_buffer[EVENT_BUFFER_SIZE]; // Shared buffer
-atomic_size_t head = 0; // Keyboard INPUT thread (producer) only
-atomic_size_t tail = 0; // Keyboard OUTPUT thread (consumer) only
+#define EVENT_BUFFER_SIZE (1<<18)
+pthread_mutex_t kb_buffer_mutex = PTHREAD_MUTEX_INITIALIZER; // Mutex to protect buffer access
+struct input_event kb_event_buffer[EVENT_BUFFER_SIZE];
+size_t head = 0; // Keyboard INPUT thread (write index)
+size_t tail = 0; // Keyboard OUTPUT thread (read index)
+
+// Clear keyboard buffer by abandoning buffered events (called from INPUT thread)
+static void clear_keyboard_buffer(void) {
+	pthread_mutex_lock(&kb_buffer_mutex);
+	{
+		// Jump head forward to abandon buffered events
+		// Safe because we only READ tail and WRITE head (which we own)
+		head = tail;
+		
+		// Drain semaphore of stale posts
+		int sem_value;
+		sem_getvalue(&kb_event_sem, &sem_value);
+		while (sem_value > 0) {
+			sem_trywait(&kb_event_sem);
+			sem_getvalue(&kb_event_sem, &sem_value);
+		}
+	}
+	pthread_mutex_unlock(&kb_buffer_mutex);
+	
+	fprintf(stderr, "Keyboard event buffer cleared\n");
+}
 
 // Function to send an input event to the keyboard event buffer for the OUTPUT thread to process
 static void send_input_event_to_keyboard(struct input_event* ev) {
-	// Add the event to the ring buffer
-	size_t next_head = (head + 1) % EVENT_BUFFER_SIZE;
-	if (next_head == tail) {
-		// Buffer is full, drop the event
-		fprintf(stderr, "Keyboard event buffer full, dropping event (type=%d, code=%d, value=%d)\n",
-			ev->type, ev->code, ev->value);
-		return;
+	pthread_mutex_lock(&kb_buffer_mutex);
+	{
+		// Add the event to the ring buffer
+		size_t next_head = (head + 1) % EVENT_BUFFER_SIZE;
+		int sem_value;
+		sem_getvalue(&kb_event_sem, &sem_value);
+		
+		if (next_head == tail)
+		{
+			// Buffer is full, this should never happen
+			fprintf(stderr, "Keyboard event buffer overflow detected (head=%zu, tail=%zu, sem_value=%d)\n", head, tail, sem_value);
+			fprintf(stderr, "Keyboard event buffer full, (type=%d, code=%d, value=%d)\n",
+				ev->type, ev->code, ev->value);
+			exit(1); 
+			return;
+		}
+
+		kb_event_buffer[head] = *ev;
+		head = next_head;
 	}
-	kb_event_buffer[head] = *ev;
-	head = next_head;
+	pthread_mutex_unlock(&kb_buffer_mutex);
 
 	// Signal that a new event is available
-	if (sem_post(&kb_event_sem) != 0) {
+	if (sem_post(&kb_event_sem) != 0)
+	{
 		fprintf(stderr, "sem_post failed when sending keyboard event\n");
 	}
 }
 
 // Thread that will handle mouse INPUT and OUTPUT events
 typedef struct {
-	const char* event_device_path;
+	const char* vendor_id;
+	const char* model_id;
 	const int out_fd;
 } mouse_thread_args_t;
 void* mouse_thread_io_func(void* args_void) {
 	mouse_thread_args_t* args = (mouse_thread_args_t*)args_void;
 
-	// Open the mouse event device
-	int mouse_fd = open(args->event_device_path, O_RDONLY);
-	if (mouse_fd < 0) {
-		fprintf(stderr, "Failed to open mouse event device: %s\n", args->event_device_path);
+	// Find, open and grab the mouse event device
+	int mouse_fd = find_open_and_grab_device(args->vendor_id, args->model_id, "mouse");
+	if (mouse_fd < 0)
+	{
 		pthread_exit(NULL);
-	}
-	// Capture events
-	if (ioctl(mouse_fd, EVIOCGRAB, 1) < 0) {
-		fprintf(stderr, "Failed to grab mouse event device\n");
 	}
 
 	// Accumulators for scaled movement
@@ -83,105 +232,115 @@ void* mouse_thread_io_func(void* args_void) {
 	const size_t ev_size = sizeof(struct input_event);
 
 	// Read events in a loop
+	int consecutive_failures = 0;
 	while (1) {
 		// Read an event
 		struct input_event ev = {0};
 		ssize_t n = read(mouse_fd, &ev, ev_size);
 		if (n != ev_size) {
-			fprintf(stderr, "Failed to read mouse event\n");
+			int err = errno;
+			fprintf(stderr, "Failed to read mouse event: read returned %zd bytes, errno=%d (%s)\n",
+				n, err, get_errno_name(err));
+			fprintf(stderr, "  Mouse fd=%d, is_valid=%d, consecutive_failures=%d\n", 
+				mouse_fd, is_fd_valid(mouse_fd), consecutive_failures);
+			
+			// Always try to reopen on any read error
+			if (reopen_device(&mouse_fd, args->vendor_id, args->model_id, "mouse") == 0) {
+				consecutive_failures = 0;
+				// Reset accumulators on reconnect
+				accum_x = 0.0;
+				accum_y = 0.0;
+			} else {
+				consecutive_failures++;
+				sleep(5); // Wait before retrying
+			}
 			continue;
 		}
+		
+		// Reset failure counter on successful read
+		consecutive_failures = 0;
 
 		switch (ev.type)
 		{
-			case EV_KEY:
-			{
-				// Only send side buttons to keyboard, forward others to mouse
-				if (ev.code == BTN_SIDE || ev.code == BTN_EXTRA) {
-					// Convert side buttons to modifier keys
-					if      (ev.code == BTN_SIDE) ev.code = KEY_LEFTSHIFT;
-					else if (ev.code == BTN_EXTRA) ev.code = KEY_LEFTCTRL;
+		case EV_KEY:
+		{
+			// Only send side buttons to keyboard, forward others to mouse
+			if (ev.code == BTN_SIDE || ev.code == BTN_EXTRA) {
+				// Convert side buttons to modifier keys
+				if      (ev.code == BTN_SIDE) ev.code = KEY_LEFTSHIFT;
+				else if (ev.code == BTN_EXTRA) ev.code = KEY_LEFTCTRL;
+				send_input_event_to_keyboard(&ev);
+			} else {
+				ssize_t written = write(args->out_fd, &ev, ev_size);
+				if (written != ev_size) {
+					fprintf(stderr, "Failed to write mouse button event: wrote %zd/%zu bytes\n", written, ev_size);
+				}
+			}
+		} break;
+		case EV_REL:
+		{
+			// Scale mouse movement
+			if (ev.code == REL_X) {
+				accum_x += ev.value * DPI_SCALE;
+				int int_move = (int)roundf(accum_x);
+				accum_x -= int_move;
+				ev.value = int_move;
+			} else if (ev.code == REL_Y) {
+				accum_y += ev.value * DPI_SCALE;
+				int int_move = (int)roundf(accum_y);
+				accum_y -= int_move;
+				ev.value = int_move;
+			}
+			ssize_t written = write(args->out_fd, &ev, ev_size);
+			if (written != ev_size) {
+				fprintf(stderr, "Failed to write mouse REL event: wrote %zd/%zu bytes\n", written, ev_size);
+			}
+		} break;
+		case EV_MSC:
+		{
+			if (ev.code == MSC_SCAN) {
+				if (ev.value == SCAN_BTN_SIDE) {
+					ev.value = SCAN_KEY_SHIFT;
+					send_input_event_to_keyboard(&ev);
+				} else if (ev.value == SCAN_BTN_EXTRA) {
+					ev.value = SCAN_KEY_CTRL;
 					send_input_event_to_keyboard(&ev);
 				} else {
 					ssize_t written = write(args->out_fd, &ev, ev_size);
 					if (written != ev_size) {
-						fprintf(stderr, "Failed to write mouse button event: wrote %zd/%zu bytes\n", written, ev_size);
+						fprintf(stderr, "Failed to write mouse MSC scan event: wrote %zd/%zu bytes\n", written, ev_size);
 					}
 				}
-			} break;
-			case EV_REL:
-			{
-				// Scale mouse movement
-				if (ev.code == REL_X) {
-					accum_x += ev.value * DPI_SCALE;
-					int int_move = (int)roundf(accum_x);
-					accum_x -= int_move;
-					ev.value = int_move;
-				} else if (ev.code == REL_Y) {
-					accum_y += ev.value * DPI_SCALE;
-					int int_move = (int)roundf(accum_y);
-					accum_y -= int_move;
-					ev.value = int_move;
-				}
+			} else {
 				ssize_t written = write(args->out_fd, &ev, ev_size);
 				if (written != ev_size) {
-					fprintf(stderr, "Failed to write mouse REL event: wrote %zd/%zu bytes\n", written, ev_size);
+					fprintf(stderr, "Failed to write mouse MSC event: wrote %zd/%zu bytes\n", written, ev_size);
 				}
-			} break;
-			case EV_MSC:
-			{
-				if (ev.code == MSC_SCAN)
-				{
-					if (ev.value == 0x90004)
-					{
-						ev.value = 0x70004;
-						send_input_event_to_keyboard(&ev);
-					}
-					else if (ev.value == 0x90005)
-					{
-						ev.value = 0x70005;
-						send_input_event_to_keyboard(&ev);
-					}
-					else
-					{
-						ssize_t written = write(args->out_fd, &ev, ev_size);
-						if (written != ev_size) {
-							fprintf(stderr, "Failed to write mouse MSC scan event: wrote %zd/%zu bytes\n", written, ev_size);
-						}
-					}
-				}
-				else
-				{
-					ssize_t written = write(args->out_fd, &ev, ev_size);
-					if (written != ev_size) {
-						fprintf(stderr, "Failed to write mouse MSC event: wrote %zd/%zu bytes\n", written, ev_size);
-					}
-				}
-			} break;
-			case EV_SYN:
-			{
-				// Write event to both buffers
-				send_input_event_to_keyboard(&ev);
-				ssize_t written = write(args->out_fd, &ev, ev_size);
-				if (written != ev_size) {
-					fprintf(stderr, "Failed to write mouse SYN event: wrote %zd/%zu bytes\n", written, ev_size);
-				}
-			} break;
-			default:
-			{
-				// Forward other events to mouse
-				ssize_t written = write(args->out_fd, &ev, ev_size);
-				if (written != ev_size) {
-					fprintf(stderr, "Failed to write mouse event (type=%d, code=%d): wrote %zd/%zu bytes\n", 
-						ev.type, ev.code, written, ev_size);
-				}
-			} break;
+			}
+		} break;
+		case EV_SYN:
+		{
+			// Write event to both buffers
+			send_input_event_to_keyboard(&ev);
+			ssize_t written = write(args->out_fd, &ev, ev_size);
+			if (written != ev_size) {
+				fprintf(stderr, "Failed to write mouse SYN event: wrote %zd/%zu bytes\n", written, ev_size);
+			}
+		} break;
+		default:
+		{
+			// Forward other events to mouse
+			ssize_t written = write(args->out_fd, &ev, ev_size);
+			if (written != ev_size) {
+				fprintf(stderr, "Failed to write mouse event (type=%d, code=%d): wrote %zd/%zu bytes\n", 
+					ev.type, ev.code, written, ev_size);
+			}
+		} break;
 		}
 	}
 
-	// Release the mouse device
-	ioctl(mouse_fd, EVIOCGRAB, 0);
-	close(mouse_fd);
+	// Release and close the mouse device
+	release_and_close_device(mouse_fd, "mouse");
 
 	pthread_exit(NULL);
 }
@@ -189,37 +348,51 @@ void* mouse_thread_io_func(void* args_void) {
 
 // Thread that will handle INPUT keyboard events
 typedef struct {
-	const char* event_device_path;
+	const char* vendor_id;
+	const char* model_id;
 } keyboard_thread_args_t;
 void* keyboard_process_i(void* args_void) {
 	keyboard_thread_args_t* args = (keyboard_thread_args_t*)args_void;
 
-	// Open the keyboard event device
-	int kb_fd = open(args->event_device_path, O_RDONLY);
+	// Find, open and grab the keyboard event device
+	int kb_fd = find_open_and_grab_device(args->vendor_id, args->model_id, "keyboard");
 	if (kb_fd < 0) {
-		fprintf(stderr, "Failed to open keyboard event device: %s\n", args->event_device_path);
 		pthread_exit(NULL);
-	}
-	// Capture events
-	if (ioctl(kb_fd, EVIOCGRAB, 1) < 0) {
-		fprintf(stderr, "Failed to grab keyboard event device\n");
 	}
 
 	// Read events in a loop
+	int consecutive_failures = 0;
 	while (1) {
 		struct input_event ev;
 		ssize_t n = read(kb_fd, &ev, sizeof(ev));
 		if (n != sizeof(ev)) {
-			fprintf(stderr, "Failed to read keyboard event\n");
+			int err = errno;
+			fprintf(stderr, "Failed to read keyboard event: read returned %zd bytes, errno=%d (%s)\n", 
+				n, err, get_errno_name(err));
+			fprintf(stderr, "  Keyboard fd=%d, is_valid=%d\n", kb_fd, is_fd_valid(kb_fd));
+			
+			// Clear the buffer before reopening to avoid stale events
+			clear_keyboard_buffer();
+			
+			// Always try to reopen on any read error
+			if (reopen_device(&kb_fd, args->vendor_id, args->model_id, "keyboard") == 0) {
+				consecutive_failures = 0;
+			} else {
+				consecutive_failures++;
+				sleep(5); // Wait before retrying
+			}
 			continue;
 		}
+		
+		// Reset failure counter on successful read
+		consecutive_failures = 0;
+		
 		// Process the keyboard event here
 		send_input_event_to_keyboard(&ev);
 	}
 
-	// Release the keyboard device
-	ioctl(kb_fd, EVIOCGRAB, 0);
-	close(kb_fd);
+	// Release and close the keyboard device
+	release_and_close_device(kb_fd, "keyboard");
 
 	pthread_exit(NULL);
 }
@@ -234,20 +407,26 @@ void* keyboard_process_o(void* args_void) {
 	// Write events in a loop
 	while (1) {
 		// Wait for an event to be available
-		if (sem_wait(&kb_event_sem) != 0) {
+		if (sem_wait(&kb_event_sem) != 0)
+		{
 			fprintf(stderr, "sem_wait failed in keyboard output thread\n");
 			continue;
 		}
+		// int sem_value;
+		// sem_getvalue(&kb_event_sem, &sem_value);
+		// fprintf(stderr, "Keyboard output thread woke up, semaphore value=%d\n", sem_value);
 
 		// Get the next event from the buffer
-		struct input_event ev = kb_event_buffer[tail];
-		tail = (tail + 1) % EVENT_BUFFER_SIZE;
+		size_t current_tail = atomic_load(&tail);
+		struct input_event ev = kb_event_buffer[current_tail];
+		atomic_store(&tail, (current_tail + 1) % EVENT_BUFFER_SIZE);
 
 		// Forward the event to the virtual keyboard device
 		ssize_t written = write(args->out_fd, &ev, sizeof(ev));
 		if (written != sizeof(ev)) {
-			fprintf(stderr, "Failed to write keyboard event (type=%d, code=%d, value=%d): wrote %zd/%zu bytes\n",
-				ev.type, ev.code, ev.value, written, sizeof(ev));
+			int err = errno;
+			fprintf(stderr, "Failed to write keyboard event (type=%d, code=%d, value=%d): wrote %zd/%zu bytes, errno=%d (%s)\n",
+				ev.type, ev.code, ev.value, written, sizeof(ev), err, get_errno_name(err));
 		}
 	}
 
@@ -258,112 +437,49 @@ void* keyboard_process_o(void* args_void) {
 
 int main()
 {
-
-	// Generic variables.
-	struct sd_device_enumerator *enumerator = NULL;
-	int r = 0;
-	sd_device *device = NULL;
-
-	// Disable stdout buffering for real-time logging.
-	setvbuf(stdout, NULL, _IONBF, 0);
-
 	fprintf(stderr, "Starting G502 daemon...\n");
 	sleep(1);
 
-
-
-
-	// Holders for device paths.
-	// e.g. "/dev/input/eventX"
-	char* g502_event_device_path = NULL;
-	char* keyboard_event_device_path = NULL;
-
-
-
-
-	// First we must find which event devices corresponds to the G502.
-	enumerator = NULL;
-	r = sd_device_enumerator_new(&enumerator);
-	if (r < 0)
-	{
-		fprintf(stderr, "Failed to create device enumerator\n");
+	char* g502_event_device_path = find_event_device(G502_USB_VENDOR_ID_S, G502_MODEL_ID_S, "G502");
+	if (!g502_event_device_path) {
 		return 1;
 	}
+	free(g502_event_device_path);
 
-	// To find these values, use `udevadm info --query=all --name=/dev/input/eventX` where X is the event number.
-	sd_device_enumerator_add_match_subsystem(enumerator, "input", 1);
-	sd_device_enumerator_add_match_sysname(enumerator, "event*");
-	sd_device_enumerator_add_match_property(enumerator, "ID_USB_VENDOR_ID", G502_USB_VENDOR_ID_S);
-	sd_device_enumerator_add_match_property(enumerator, "ID_MODEL_ID", G502_MODEL_ID_S);
-
-	device = sd_device_enumerator_get_device_first(enumerator);
-	if (!device)
-	{
-		fprintf(stderr, "G502 device not found\n");
-		sd_device_enumerator_unref(enumerator);
+	char* keyboard_event_device_path = find_event_device(KB_USB_VENDOR_ID_S, KB_MODEL_ID_S, "Keyboard");
+	if (!keyboard_event_device_path) {
 		return 1;
 	}
+	free(keyboard_event_device_path);
 
-	sd_device_get_devname(device, (const char**)&g502_event_device_path);
-	g502_event_device_path = strdup(g502_event_device_path); // Duplicate the string to avoid issues later
-	fprintf(stderr, "G502 device found: %s\n", g502_event_device_path);
-	sd_device_enumerator_unref(enumerator);
-
-
-
-
-	// Next we find the keyboard device.
-	enumerator = NULL;
-	r = sd_device_enumerator_new(&enumerator);
-	if (r < 0)
-	{
-		fprintf(stderr, "Failed to create device enumerator\n");
-		return 1;
-	}
-
-	sd_device_enumerator_add_match_subsystem(enumerator, "input", 1);
-	sd_device_enumerator_add_match_sysname(enumerator, "event*");
-	sd_device_enumerator_add_match_property(enumerator, "ID_USB_VENDOR_ID", KB_USB_VENDOR_ID_S);
-	sd_device_enumerator_add_match_property(enumerator, "ID_MODEL_ID", KB_MODEL_ID_S);
-
-	device = sd_device_enumerator_get_device_first(enumerator);
-	if (!device)
-	{
-		fprintf(stderr, "Keyboard device not found\n");
-		sd_device_enumerator_unref(enumerator);
-		return 1;
-	}
-
-	sd_device_get_devname(device, (const char**)&keyboard_event_device_path);
-	keyboard_event_device_path = strdup(keyboard_event_device_path); // Duplicate the string to avoid issues later
-	fprintf(stderr, "Keyboard device found: %s\n", keyboard_event_device_path);
-	sd_device_enumerator_unref(enumerator);
-
-
-
-
-	// Now we have the event devices, we can create the virtual devices
+	// Now we have verified the devices exist, create the virtual devices
 	
-	// First the virtual G502 device
+	// Create virtual G502 device
 	int v_g502_fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
-	if (v_g502_fd < 0)
-	{
+	if (v_g502_fd < 0) {
 		fprintf(stderr, "Failed to open /dev/uinput for virtual G502\n");
 		return 1;
 	}
 	// Enable button events
-	ioctl(v_g502_fd, UI_SET_EVBIT, EV_KEY);
-	ioctl(v_g502_fd, UI_SET_KEYBIT, BTN_LEFT);
-	ioctl(v_g502_fd, UI_SET_KEYBIT, BTN_RIGHT);
-	ioctl(v_g502_fd, UI_SET_KEYBIT, BTN_MIDDLE);
+	if (ioctl(v_g502_fd, UI_SET_EVBIT, EV_KEY) < 0 ||
+	    ioctl(v_g502_fd, UI_SET_KEYBIT, BTN_LEFT) < 0 ||
+	    ioctl(v_g502_fd, UI_SET_KEYBIT, BTN_RIGHT) < 0 ||
+	    ioctl(v_g502_fd, UI_SET_KEYBIT, BTN_MIDDLE) < 0 ||
+	    ioctl(v_g502_fd, UI_SET_KEYBIT, KEY_LEFTSHIFT) < 0 ||
+	    ioctl(v_g502_fd, UI_SET_KEYBIT, KEY_LEFTCTRL) < 0) {
+		fprintf(stderr, "Failed to set virtual G502 key bits\n");
+		close(v_g502_fd);
+		return 1;
+	}
 	// Enable relative events
-	ioctl(v_g502_fd, UI_SET_EVBIT, EV_REL);
-	ioctl(v_g502_fd, UI_SET_RELBIT, REL_X);
-	ioctl(v_g502_fd, UI_SET_RELBIT, REL_Y);
-	ioctl(v_g502_fd, UI_SET_RELBIT, REL_WHEEL);
-	// Enable left shift and left ctrl keys
-	ioctl(v_g502_fd, UI_SET_KEYBIT, KEY_LEFTSHIFT);
-	ioctl(v_g502_fd, UI_SET_KEYBIT, KEY_LEFTCTRL);
+	if (ioctl(v_g502_fd, UI_SET_EVBIT, EV_REL) < 0 ||
+	    ioctl(v_g502_fd, UI_SET_RELBIT, REL_X) < 0 ||
+	    ioctl(v_g502_fd, UI_SET_RELBIT, REL_Y) < 0 ||
+	    ioctl(v_g502_fd, UI_SET_RELBIT, REL_WHEEL) < 0) {
+		fprintf(stderr, "Failed to set virtual G502 relative bits\n");
+		close(v_g502_fd);
+		return 1;
+	}
 
 	struct uinput_setup v_g502_setup = {
 		.id = {
@@ -373,32 +489,37 @@ int main()
 		},
 		.name = "Virtual G502 Hero",
 	};
-	ioctl(v_g502_fd, UI_DEV_SETUP, &v_g502_setup);
-	ioctl(v_g502_fd, UI_DEV_CREATE);
-	fprintf(stderr, "Virtual G502 device created\n");
-
-
-
-
-	// Then the virtual keyboard device
+	if (ioctl(v_g502_fd, UI_DEV_SETUP, &v_g502_setup) < 0 ||
+	    ioctl(v_g502_fd, UI_DEV_CREATE) < 0) {
+		fprintf(stderr, "Failed to create virtual G502 device\n");
+		close(v_g502_fd);
+		return 1;
+	}
+	fprintf(stderr, "Virtual G502 device created\n");	// Create virtual keyboard device
 	int v_kb_fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
-	if (v_kb_fd < 0)
-	{
+	if (v_kb_fd < 0) {
 		fprintf(stderr, "Failed to open /dev/uinput for virtual keyboard\n");
+		close(v_g502_fd);
 		return 1;
 	}
 	// Enable key events (all keys from 0 to 255)
-	// This is a simple way to enable all keys, but not the most efficient.
-	// A more efficient way would be to only enable the keys we need.
-	// But for simplicity, we enable all keys here.
-	ioctl(v_kb_fd, UI_SET_EVBIT, EV_KEY);
-	for (int code = 0; code < 255; code++)
-	{
+	if (ioctl(v_kb_fd, UI_SET_EVBIT, EV_KEY) < 0) {
+		fprintf(stderr, "Failed to set virtual keyboard event bit\n");
+		close(v_kb_fd);
+		close(v_g502_fd);
+		return 1;
+	}
+	for (int code = 0; code < 255; code++) {
 		ioctl(v_kb_fd, UI_SET_KEYBIT, code);
 	}
 	// Enable MSC events for scan codes
-	ioctl(v_kb_fd, UI_SET_EVBIT, EV_MSC);
-	ioctl(v_kb_fd, UI_SET_MSCBIT, MSC_SCAN);
+	if (ioctl(v_kb_fd, UI_SET_EVBIT, EV_MSC) < 0 ||
+	    ioctl(v_kb_fd, UI_SET_MSCBIT, MSC_SCAN) < 0) {
+		fprintf(stderr, "Failed to set virtual keyboard MSC bits\n");
+		close(v_kb_fd);
+		close(v_g502_fd);
+		return 1;
+	}
 	struct uinput_setup v_kb_setup = {
 		.id = {
 			.bustype = BUS_USB,
@@ -407,40 +528,62 @@ int main()
 		},
 		.name = "Virtual Keyboard",
 	};
-	ioctl(v_kb_fd, UI_DEV_SETUP, &v_kb_setup);
-	ioctl(v_kb_fd, UI_DEV_CREATE);
-	fprintf(stderr, "Virtual keyboard device created\n");
-
-
-
-	// Initialize semaphore for keyboard event buffer
-	if (sem_init(&kb_event_sem, 0, 0) != 0) {
-		fprintf(stderr, "Failed to initialize semaphore\n");
+	if (ioctl(v_kb_fd, UI_DEV_SETUP, &v_kb_setup) < 0 ||
+	    ioctl(v_kb_fd, UI_DEV_CREATE) < 0) {
+		fprintf(stderr, "Failed to create virtual keyboard device\n");
+		close(v_kb_fd);
+		close(v_g502_fd);
 		return 1;
 	}
-
+	fprintf(stderr, "Virtual keyboard device created\n");	// Initialize semaphore for keyboard event buffer
+	if (sem_init(&kb_event_sem, 0, 0) != 0) {
+		fprintf(stderr, "Failed to initialize semaphore\n");
+		close(v_kb_fd);
+		close(v_g502_fd);
+		return 1;
+	}
 
 	// Start keyboard OUTPUT thread
 	pthread_t kb_output_thread;
 	keyboard_output_thread_args_t kb_output_args = {
 		.out_fd = v_kb_fd,
 	};
-	pthread_create(&kb_output_thread, NULL, keyboard_process_o, &kb_output_args);
+	if (pthread_create(&kb_output_thread, NULL, keyboard_process_o, &kb_output_args) != 0) {
+		fprintf(stderr, "Failed to create keyboard output thread\n");
+		sem_destroy(&kb_event_sem);
+		close(v_kb_fd);
+		close(v_g502_fd);
+		return 1;
+	}
 
 	// Start keyboard INPUT thread
 	pthread_t kb_input_thread;
 	keyboard_thread_args_t kb_input_args = {
-		.event_device_path = keyboard_event_device_path,
+		.vendor_id = KB_USB_VENDOR_ID_S,
+		.model_id = KB_MODEL_ID_S,
 	};
-	pthread_create(&kb_input_thread, NULL, keyboard_process_i, &kb_input_args);
+	if (pthread_create(&kb_input_thread, NULL, keyboard_process_i, &kb_input_args) != 0) {
+		fprintf(stderr, "Failed to create keyboard input thread\n");
+		sem_destroy(&kb_event_sem);
+		close(v_kb_fd);
+		close(v_g502_fd);
+		return 1;
+	}
 
 	// Start mouse IO thread
 	pthread_t mouse_io_thread;
 	mouse_thread_args_t mouse_io_args = {
-		.event_device_path = g502_event_device_path,
+		.vendor_id = G502_USB_VENDOR_ID_S,
+		.model_id = G502_MODEL_ID_S,
 		.out_fd = v_g502_fd,
 	};
-	pthread_create(&mouse_io_thread, NULL, mouse_thread_io_func, &mouse_io_args);
+	if (pthread_create(&mouse_io_thread, NULL, mouse_thread_io_func, &mouse_io_args) != 0) {
+		fprintf(stderr, "Failed to create mouse IO thread\n");
+		sem_destroy(&kb_event_sem);
+		close(v_kb_fd);
+		close(v_g502_fd);
+		return 1;
+	}
 
 	// Wait for threads to finish (they won't, this is just to keep the main thread alive)
 	pthread_join(mouse_io_thread, NULL);
@@ -448,10 +591,9 @@ int main()
 	pthread_join(kb_output_thread, NULL);
 
 	// Cleanup and exit
-	ioctl(v_kb_fd, EVIOCGRAB, 0); // Release the keyboard device
-	close(v_kb_fd); // Close virtual keyboard device
-	ioctl(v_g502_fd, EVIOCGRAB, 0); // Release the keyboard device
-	close(v_g502_fd); // Close virtual G502 device
+	sem_destroy(&kb_event_sem);
+	close(v_kb_fd);
+	close(v_g502_fd);
 
 	return 0;
 }

@@ -34,3 +34,7 @@ systemctl --user daemon-reload
 systemctl --user enable "$SERVICE_NAME"
 systemctl --user start "$SERVICE_NAME"
 echo "$SERVICE_NAME is now enabled and started."
+
+echo "Wait a few seconds for the virtual devices to be created."
+sleep 5
+echo "Installation complete!"
