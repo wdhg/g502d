@@ -18,9 +18,9 @@ cd g502d
 
 # Build the daemon
 # Note, this will use the configuation defined in config.h
-# You will likely need to update this file as it contains hardcoded keyboard vendor and model IDs
-# (Unless you also happen to have a Unicomp Model M keyboard :P)
-# This file also contains a fixed DPI scaling modifier which you may want to adjust
+# Keyboards are detected automatically, so there is nothing to configure for them.
+# config.h holds the button-to-key mapping and a fixed DPI scaling modifier,
+# both of which you may want to adjust
 ./build.sh
 
 # I recommend testing the daemon before installing it as a service
@@ -101,6 +101,31 @@ In Hyprland that means:
 
 Rebinding the paddle and the two behind-wheel buttons removes all on-device DPI control, so
 DPI is fixed at the profile default. Restore from a backup to get it back.
+
+### Recovery
+
+The bindings live in the mouse, not in this repo, so reinstalling the daemon will not
+restore them. If G HUB, a firmware update or a factory reset wipes profile 1, reapply all
+three in one go:
+
+    ./tools/profile.py apply 1 6 mouse:6 --i-understand-this-writes-flash   # thumb paddle
+    ./tools/profile.py apply 1 7 mouse:7 --i-understand-this-writes-flash   # behind wheel, upper
+    ./tools/profile.py apply 1 8 mouse:8 --i-understand-this-writes-flash   # behind wheel, lower
+
+Check the result with `./tools/profile.py show`. Buttons 6, 7 and 8 should read
+`80 01 00 20`, `80 01 00 40` and `80 01 00 80`.
+
+To go back to the factory layout, including on-device DPI control:
+
+    ./tools/profile_backup.py save /tmp/before-restore.bin      # keep the current state first
+    ./tools/profile.py restore <backup>.bin 1 --i-understand-this-writes-flash
+
+Take a backup before any of this, and keep it somewhere outside the repo:
+
+    ./tools/profile_backup.py save ~/.local/share/g502d/onboard-$(date +%F).bin
+
+If the mouse ends up in a bad state, unplugging it clears anything volatile (button spy,
+host mode). Feature `0x1802 DEVICE_RESET` is the last resort.
 
 ### Reading buttons without writing flash
 

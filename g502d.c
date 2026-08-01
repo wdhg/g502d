@@ -101,6 +101,93 @@ static char* find_event_device(const char* vendor_id, const char* model_id, cons
 	return result;
 }
 
+// A keyboard the daemon has taken over.
+// The syspath is the stable identity used to find the device again after a
+// disconnect; the /dev/input/eventN number can change across replugs.
+#define MAX_KEYBOARDS 16
+typedef struct {
+	char syspath[256];
+	char devnode[64];
+	char name[128];
+} keyboard_device_t;
+
+// Find every real keyboard on the system.
+//
+// Keyboards are identified by udev's ID_INPUT_KEYBOARD tag rather than by hardcoded
+// vendor and model IDs, so this works on any machine without configuration. Devices
+// under /sys/devices/virtual are skipped: those are uinput devices, including the
+// virtual keyboard this daemon itself creates, and grabbing our own output would
+// feed events straight back into the buffer.
+static int find_keyboard_devices(keyboard_device_t* out, int max) {
+	struct sd_device_enumerator *enumerator = NULL;
+	if (sd_device_enumerator_new(&enumerator) < 0) {
+		fprintf(stderr, "Failed to create keyboard enumerator\n");
+		return 0;
+	}
+
+	sd_device_enumerator_add_match_subsystem(enumerator, "input", 1);
+	sd_device_enumerator_add_match_sysname(enumerator, "event*");
+	sd_device_enumerator_add_match_property(enumerator, "ID_INPUT_KEYBOARD", "1");
+
+	int count = 0;
+	for (sd_device *device = sd_device_enumerator_get_device_first(enumerator);
+	     device && count < max;
+	     device = sd_device_enumerator_get_device_next(enumerator)) {
+		const char* syspath = NULL;
+		const char* devnode = NULL;
+		if (sd_device_get_syspath(device, &syspath) < 0 ||
+		    sd_device_get_devname(device, &devnode) < 0) {
+			continue;
+		}
+		// Skip uinput devices, ours included.
+		if (strncmp(syspath, "/sys/devices/virtual/", 21) == 0) {
+			continue;
+		}
+
+		keyboard_device_t* kb = &out[count];
+		snprintf(kb->syspath, sizeof(kb->syspath), "%s", syspath);
+		snprintf(kb->devnode, sizeof(kb->devnode), "%s", devnode);
+
+		// NAME is quoted in udev's property list; strip the quotes for logging.
+		const char* name = NULL;
+		if (sd_device_get_property_value(device, "NAME", &name) < 0 || !name) {
+			sd_device *parent = NULL;
+			if (sd_device_get_parent(device, &parent) >= 0) {
+				sd_device_get_sysattr_value(parent, "name", &name);
+			}
+		}
+		if (name) {
+			size_t len = strlen(name);
+			if (len >= 2 && name[0] == '"' && name[len - 1] == '"') {
+				snprintf(kb->name, sizeof(kb->name), "%.*s", (int)(len - 2), name + 1);
+			} else {
+				snprintf(kb->name, sizeof(kb->name), "%s", name);
+			}
+		} else {
+			snprintf(kb->name, sizeof(kb->name), "%s", devnode);
+		}
+
+		count++;
+	}
+
+	sd_device_enumerator_unref(enumerator);
+	return count;
+}
+
+// Re-resolve a keyboard's device node after a disconnect, matching on syspath.
+// Returns 0 if the device is back, -1 if it is still gone.
+static int refresh_keyboard_devnode(keyboard_device_t* kb) {
+	keyboard_device_t found[MAX_KEYBOARDS];
+	int n = find_keyboard_devices(found, MAX_KEYBOARDS);
+	for (int i = 0; i < n; i++) {
+		if (strcmp(found[i].syspath, kb->syspath) == 0) {
+			snprintf(kb->devnode, sizeof(kb->devnode), "%s", found[i].devnode);
+			return 0;
+		}
+	}
+	return -1;
+}
+
 // Helper function to open and grab an input device
 static int open_and_grab_device(const char* device_path, const char* device_name) {
 	int fd = open(device_path, O_RDONLY);
@@ -360,53 +447,50 @@ void* mouse_thread_io_func(void* args_void) {
 }
 
 
-// Thread that will handle INPUT keyboard events
-typedef struct {
-	const char* vendor_id;
-	const char* model_id;
-} keyboard_thread_args_t;
+// Thread that will handle INPUT keyboard events.
+// One of these runs per physical keyboard; they all feed the same event buffer.
 void* keyboard_process_i(void* args_void) {
-	keyboard_thread_args_t* args = (keyboard_thread_args_t*)args_void;
+	keyboard_device_t* kb = (keyboard_device_t*)args_void;
 
-	// Find, open and grab the keyboard event device
-	int kb_fd = find_open_and_grab_device(args->vendor_id, args->model_id, "keyboard");
+	// Open and grab the keyboard event device
+	int kb_fd = open_and_grab_device(kb->devnode, kb->name);
 	if (kb_fd < 0) {
 		pthread_exit(NULL);
 	}
+	fprintf(stderr, "Grabbed keyboard: %s (%s)\n", kb->name, kb->devnode);
 
 	// Read events in a loop
-	int consecutive_failures = 0;
 	while (1) {
 		struct input_event ev;
 		ssize_t n = read(kb_fd, &ev, sizeof(ev));
 		if (n != sizeof(ev)) {
 			int err = errno;
-			fprintf(stderr, "Failed to read keyboard event: read returned %zd bytes, errno=%d (%s)\n", 
-				n, err, get_errno_name(err));
+			fprintf(stderr, "Failed to read from keyboard %s: read returned %zd bytes, errno=%d (%s)\n",
+				kb->name, n, err, get_errno_name(err));
 			fprintf(stderr, "  Keyboard fd=%d, is_valid=%d\n", kb_fd, is_fd_valid(kb_fd));
-			
+
 			// Clear the buffer before reopening to avoid stale events
 			clear_keyboard_buffer();
-			
+
 			// Always try to reopen on any read error
-			if (reopen_device(&kb_fd, args->vendor_id, args->model_id, "keyboard") == 0) {
-				consecutive_failures = 0;
+			release_and_close_device(kb_fd, kb->name);
+			kb_fd = -1;
+			sleep(1);
+			if (refresh_keyboard_devnode(kb) == 0 &&
+			    (kb_fd = open_and_grab_device(kb->devnode, kb->name)) >= 0) {
+				fprintf(stderr, "Reopened keyboard: %s (%s)\n", kb->name, kb->devnode);
 			} else {
-				consecutive_failures++;
 				sleep(5); // Wait before retrying
 			}
 			continue;
 		}
-		
-		// Reset failure counter on successful read
-		consecutive_failures = 0;
-		
+
 		// Process the keyboard event here
 		send_input_event_to_keyboard(&ev);
 	}
 
 	// Release and close the keyboard device
-	release_and_close_device(kb_fd, "keyboard");
+	release_and_close_device(kb_fd, kb->name);
 
 	pthread_exit(NULL);
 }
@@ -460,11 +544,18 @@ int main()
 	}
 	free(g502_event_device_path);
 
-	char* keyboard_event_device_path = find_event_device(KB_USB_VENDOR_ID_S, KB_MODEL_ID_S, "Keyboard");
-	if (!keyboard_event_device_path) {
+	// Discover every keyboard on the system. This must happen before the virtual
+	// keyboard is created, otherwise we would find and then grab our own output.
+	keyboard_device_t keyboards[MAX_KEYBOARDS];
+	int keyboard_count = find_keyboard_devices(keyboards, MAX_KEYBOARDS);
+	if (keyboard_count == 0) {
+		fprintf(stderr, "No keyboards found\n");
 		return 1;
 	}
-	free(keyboard_event_device_path);
+	fprintf(stderr, "Found %d keyboard%s:\n", keyboard_count, keyboard_count == 1 ? "" : "s");
+	for (int i = 0; i < keyboard_count; i++) {
+		fprintf(stderr, "  %s (%s)\n", keyboards[i].name, keyboards[i].devnode);
+	}
 
 	// Now we have verified the devices exist, create the virtual devices
 	
@@ -592,14 +683,21 @@ int main()
 		return 1;
 	}
 
-	// Start keyboard INPUT thread
-	pthread_t kb_input_thread;
-	keyboard_thread_args_t kb_input_args = {
-		.vendor_id = KB_USB_VENDOR_ID_S,
-		.model_id = KB_MODEL_ID_S,
-	};
-	if (pthread_create(&kb_input_thread, NULL, keyboard_process_i, &kb_input_args) != 0) {
-		fprintf(stderr, "Failed to create keyboard input thread\n");
+	// Start one INPUT thread per keyboard. They share the event buffer, which is
+	// what merges every keyboard into the single virtual keyboard.
+	pthread_t kb_input_threads[MAX_KEYBOARDS];
+	int kb_threads_started = 0;
+	for (int i = 0; i < keyboard_count; i++) {
+		if (pthread_create(&kb_input_threads[kb_threads_started], NULL,
+		                   keyboard_process_i, &keyboards[i]) != 0) {
+			fprintf(stderr, "Failed to create input thread for keyboard %s\n",
+				keyboards[i].name);
+			continue;
+		}
+		kb_threads_started++;
+	}
+	if (kb_threads_started == 0) {
+		fprintf(stderr, "Failed to create any keyboard input threads\n");
 		sem_destroy(&kb_event_sem);
 		close(v_kb_fd);
 		close(v_g502_fd);
@@ -623,7 +721,9 @@ int main()
 
 	// Wait for threads to finish (they won't, this is just to keep the main thread alive)
 	pthread_join(mouse_io_thread, NULL);
-	pthread_join(kb_input_thread, NULL);
+	for (int i = 0; i < kb_threads_started; i++) {
+		pthread_join(kb_input_threads[i], NULL);
+	}
 	pthread_join(kb_output_thread, NULL);
 
 	// Cleanup and exit
