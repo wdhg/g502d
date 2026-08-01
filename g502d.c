@@ -30,11 +30,27 @@
 
 #include "config.h"
 
-// Magic scan codes for mouse side buttons
-#define SCAN_BTN_SIDE  0x90004
-#define SCAN_BTN_EXTRA 0x90005
-#define SCAN_KEY_SHIFT 0x70004
-#define SCAN_KEY_CTRL  0x70005
+// Look up the keyboard key a mouse button is remapped to.
+// Returns 0 when the button should be forwarded to the virtual mouse untouched.
+static int mapped_key_for_button(int button_code) {
+	switch (button_code) {
+#define X(btn, key, btn_scan, key_scan) case btn: return key;
+		MODIFIER_BUTTON_MAP
+#undef X
+		default: return 0;
+	}
+}
+
+// Look up the keyboard scan code a mouse button's scan code is remapped to.
+// Returns 0 when the scan code should be forwarded to the virtual mouse untouched.
+static int mapped_scan_for_scan(int mouse_scan) {
+	switch (mouse_scan) {
+#define X(btn, key, btn_scan, key_scan) case btn_scan: return key_scan;
+		MODIFIER_BUTTON_MAP
+#undef X
+		default: return 0;
+	}
+}
 
 // Helper function to get errno string
 static const char* get_errno_name(int err) {
@@ -154,8 +170,8 @@ sem_t kb_event_sem;
 #define EVENT_BUFFER_SIZE (1<<18)
 pthread_mutex_t kb_buffer_mutex = PTHREAD_MUTEX_INITIALIZER; // Mutex to protect buffer access
 struct input_event kb_event_buffer[EVENT_BUFFER_SIZE];
-size_t head = 0; // Keyboard INPUT thread (write index)
-size_t tail = 0; // Keyboard OUTPUT thread (read index)
+_Atomic size_t head = 0; // Keyboard INPUT thread (write index)
+_Atomic size_t tail = 0; // Keyboard OUTPUT thread (read index)
 
 // Clear keyboard buffer by abandoning buffered events (called from INPUT thread)
 static void clear_keyboard_buffer(void) {
@@ -264,11 +280,11 @@ void* mouse_thread_io_func(void* args_void) {
 		{
 		case EV_KEY:
 		{
-			// Only send side buttons to keyboard, forward others to mouse
-			if (ev.code == BTN_SIDE || ev.code == BTN_EXTRA) {
+			// Only send mapped side buttons to keyboard, forward others to mouse
+			int mapped_key = mapped_key_for_button(ev.code);
+			if (mapped_key) {
 				// Convert side buttons to modifier keys
-				if      (ev.code == BTN_SIDE) ev.code = KEY_LEFTSHIFT;
-				else if (ev.code == BTN_EXTRA) ev.code = KEY_LEFTCTRL;
+				ev.code = mapped_key;
 				send_input_event_to_keyboard(&ev);
 			} else {
 				ssize_t written = write(args->out_fd, &ev, ev_size);
@@ -299,11 +315,9 @@ void* mouse_thread_io_func(void* args_void) {
 		case EV_MSC:
 		{
 			if (ev.code == MSC_SCAN) {
-				if (ev.value == SCAN_BTN_SIDE) {
-					ev.value = SCAN_KEY_SHIFT;
-					send_input_event_to_keyboard(&ev);
-				} else if (ev.value == SCAN_BTN_EXTRA) {
-					ev.value = SCAN_KEY_CTRL;
+				int mapped_scan = mapped_scan_for_scan(ev.value);
+				if (mapped_scan) {
+					ev.value = mapped_scan;
 					send_input_event_to_keyboard(&ev);
 				} else {
 					ssize_t written = write(args->out_fd, &ev, ev_size);
@@ -460,23 +474,45 @@ int main()
 		fprintf(stderr, "Failed to open /dev/uinput for virtual G502\n");
 		return 1;
 	}
-	// Enable button events
-	if (ioctl(v_g502_fd, UI_SET_EVBIT, EV_KEY) < 0 ||
-	    ioctl(v_g502_fd, UI_SET_KEYBIT, BTN_LEFT) < 0 ||
-	    ioctl(v_g502_fd, UI_SET_KEYBIT, BTN_RIGHT) < 0 ||
-	    ioctl(v_g502_fd, UI_SET_KEYBIT, BTN_MIDDLE) < 0 ||
-	    ioctl(v_g502_fd, UI_SET_KEYBIT, KEY_LEFTSHIFT) < 0 ||
-	    ioctl(v_g502_fd, UI_SET_KEYBIT, KEY_LEFTCTRL) < 0) {
-		fprintf(stderr, "Failed to set virtual G502 key bits\n");
+	// Enable button events.
+	// uinput silently discards any event whose code was not declared here, so the
+	// virtual mouse must advertise every button the real one can report. The G502
+	// descriptor declares 16 buttons, which the kernel maps to BTN_MOUSE + (n - 1),
+	// i.e. BTN_LEFT (0x110) through 0x11f. Declaring the whole range means a button
+	// that is later rebound in the onboard profile starts working without a rebuild.
+	if (ioctl(v_g502_fd, UI_SET_EVBIT, EV_KEY) < 0) {
+		fprintf(stderr, "Failed to set virtual G502 event bit\n");
 		close(v_g502_fd);
 		return 1;
 	}
-	// Enable relative events
+	for (int code = BTN_MOUSE; code < BTN_MOUSE + 16; code++) {
+		if (ioctl(v_g502_fd, UI_SET_KEYBIT, code) < 0) {
+			fprintf(stderr, "Failed to set virtual G502 key bit %d\n", code);
+			close(v_g502_fd);
+			return 1;
+		}
+	}
+	// Enable relative events.
+	// REL_HWHEEL carries the wheel tilt (the descriptor's AC Pan usage); without it
+	// every horizontal scroll is dropped. The kernel also emits high-resolution
+	// wheel deltas alongside the classic detented ones, and libinput prefers them
+	// for smooth scrolling, so mirror those too. This set matches the real device's
+	// REL bitmask (0x1943) exactly.
 	if (ioctl(v_g502_fd, UI_SET_EVBIT, EV_REL) < 0 ||
 	    ioctl(v_g502_fd, UI_SET_RELBIT, REL_X) < 0 ||
 	    ioctl(v_g502_fd, UI_SET_RELBIT, REL_Y) < 0 ||
-	    ioctl(v_g502_fd, UI_SET_RELBIT, REL_WHEEL) < 0) {
+	    ioctl(v_g502_fd, UI_SET_RELBIT, REL_WHEEL) < 0 ||
+	    ioctl(v_g502_fd, UI_SET_RELBIT, REL_HWHEEL) < 0 ||
+	    ioctl(v_g502_fd, UI_SET_RELBIT, REL_WHEEL_HI_RES) < 0 ||
+	    ioctl(v_g502_fd, UI_SET_RELBIT, REL_HWHEEL_HI_RES) < 0) {
 		fprintf(stderr, "Failed to set virtual G502 relative bits\n");
+		close(v_g502_fd);
+		return 1;
+	}
+	// Enable MSC events, otherwise the forwarded MSC_SCAN codes are dropped too.
+	if (ioctl(v_g502_fd, UI_SET_EVBIT, EV_MSC) < 0 ||
+	    ioctl(v_g502_fd, UI_SET_MSCBIT, MSC_SCAN) < 0) {
+		fprintf(stderr, "Failed to set virtual G502 MSC bits\n");
 		close(v_g502_fd);
 		return 1;
 	}
