@@ -18,6 +18,7 @@
 #include <linux/input.h>
 #include <linux/uinput.h>
 #include <math.h>
+#include <poll.h>
 #include <pthread.h>
 #include <semaphore.h>
 #include <stdatomic.h>
@@ -26,6 +27,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <systemd/sd-device.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "config.h"
@@ -54,57 +56,69 @@ static int mapped_scan_for_scan(int mouse_scan) {
 
 // Suppress contact bounce from a worn microswitch.
 //
-// A tired switch can re-close for a few tens of milliseconds after you let go,
-// as the leaf springs back through the contact point. The host sees a complete,
-// plausible second press - our G502 produced 22 ms presses 30 ms after release -
-// and apps read it as a double click. Genuine repeat clicks are hundreds of
-// milliseconds apart, so a short window after each release separates the two
-// cleanly.
+// A tired switch chatters around both edges. It can re-close for a few tens of
+// milliseconds after you let go, which the host reads as a second click; and it
+// can flick open while you are still holding it down, which the host reads as
+// the end of a drag. Our G502 produced 22 ms pulses 22-30 ms from the edge.
 //
-// A dropped press also drops its matching release, or the host would be left
-// holding a button that never went down. Suppressed releases still update the
-// timestamp so a run of several bounces is eaten rather than just the first.
+// At the instant a release arrives there is no way to tell a real one from
+// chatter, so releases are held back for CLICK_DEBOUNCE_MS. If the button goes
+// down again inside that window the release is cancelled and the press is
+// swallowed - as far as the host is concerned the button never came up, which
+// is the truth in both cases. Presses only get through when the host has
+// already seen the matching release.
+//
+// Dropping the press instead of deferring the release does fix double clicks,
+// but it breaks drags: the spurious release goes out, the recovery press is
+// eaten as bounce, and the button is left stuck up.
+//
+// The cost is up to CLICK_DEBOUNCE_MS of latency on release. Presses are never
+// delayed. The MSC_SCAN that shares a frame with a deferred or swallowed button
+// is still forwarded; libinput only reads a scancode as an annotation on a key
+// event in the same frame, so an orphaned one is ignored.
 #define DEBOUNCE_TRACKED_BUTTONS 16
+
+typedef struct {
+	struct input_event ev; // The held-back release, replayed verbatim
+	long long due_us;      // When it should be emitted
+	int active;
+} pending_release_t;
+
+// Only ever touched by the mouse thread.
+static pending_release_t pending_releases[DEBOUNCE_TRACKED_BUTTONS];
 
 static long long event_time_us(const struct input_event* ev) {
 	return (long long)ev->time.tv_sec * 1000000LL + (long long)ev->time.tv_usec;
 }
 
-// Returns 1 when the event is bounce and should be dropped.
-static int is_button_bounce(const struct input_event* ev) {
-	static long long last_release_us[DEBOUNCE_TRACKED_BUTTONS] = {0};
-	static int dropped_press[DEBOUNCE_TRACKED_BUTTONS] = {0};
+static long long now_us(void) {
+	struct timespec ts;
+	// evdev stamps events on CLOCK_REALTIME, so compare against the same clock
+	clock_gettime(CLOCK_REALTIME, &ts);
+	return (long long)ts.tv_sec * 1000000LL + (long long)ts.tv_nsec / 1000LL;
+}
 
+// Index into pending_releases, or -1 for anything we do not debounce.
+static int debounce_slot(const struct input_event* ev) {
 	if (CLICK_DEBOUNCE_MS <= 0) {
-		return 0;
+		return -1;
 	}
-
 	int slot = ev->code - BTN_MOUSE;
-	if (slot < 0 || slot >= DEBOUNCE_TRACKED_BUTTONS) {
-		return 0; // Not a mouse button, nothing to debounce
-	}
+	return (slot >= 0 && slot < DEBOUNCE_TRACKED_BUTTONS) ? slot : -1;
+}
 
-	const long long now = event_time_us(ev);
-	const long long window_us = (long long)CLICK_DEBOUNCE_MS * 1000LL;
-
-	if (ev->value == 1) {
-		long long since = now - last_release_us[slot];
-		if (last_release_us[slot] != 0 && since >= 0 && since < window_us) {
-			dropped_press[slot] = 1;
-			fprintf(stderr, "Debounce: dropped bounce on button 0x%x, %lld ms after release\n",
-				ev->code, since / 1000);
-			return 1;
+// Deadline of the release due out first, or -1 when none are held back.
+static long long next_release_due_us(void) {
+	long long soonest = -1;
+	for (int i = 0; i < DEBOUNCE_TRACKED_BUTTONS; i++) {
+		if (!pending_releases[i].active) {
+			continue;
 		}
-		dropped_press[slot] = 0;
-	} else if (ev->value == 0) {
-		last_release_us[slot] = now;
-		if (dropped_press[slot]) {
-			dropped_press[slot] = 0;
-			return 1;
+		if (soonest < 0 || pending_releases[i].due_us < soonest) {
+			soonest = pending_releases[i].due_us;
 		}
 	}
-
-	return 0;
+	return soonest;
 }
 
 // Helper function to get errno string
@@ -373,6 +387,82 @@ typedef struct {
 	const char* model_id;
 	const int out_fd;
 } mouse_thread_args_t;
+// Send a mouse button event to whichever virtual device it belongs on.
+static void emit_button_event(int out_fd, const struct input_event* ev) {
+	struct input_event out = *ev;
+	int mapped_key = mapped_key_for_button(out.code);
+	if (mapped_key) {
+		// Convert side buttons to modifier keys
+		out.code = mapped_key;
+		send_input_event_to_keyboard(&out);
+	} else {
+		ssize_t written = write(out_fd, &out, sizeof(out));
+		if (written != (ssize_t)sizeof(out)) {
+			fprintf(stderr, "Failed to write mouse button event: wrote %zd/%zu bytes\n",
+				written, sizeof(out));
+		}
+	}
+}
+
+// Close the frame a deferred release was emitted in. Mirrors the EV_SYN case
+// in the read loop, which feeds both virtual devices.
+static void emit_syn_report(int out_fd, const struct input_event* ref) {
+	struct input_event syn = *ref;
+	syn.type = EV_SYN;
+	syn.code = SYN_REPORT;
+	syn.value = 0;
+
+	send_input_event_to_keyboard(&syn);
+	ssize_t written = write(out_fd, &syn, sizeof(syn));
+	if (written != (ssize_t)sizeof(syn)) {
+		fprintf(stderr, "Failed to write deferred SYN event: wrote %zd/%zu bytes\n",
+			written, sizeof(syn));
+	}
+}
+
+// Emit any held-back releases whose window has expired. Pass force to flush
+// everything regardless, so a disappearing device cannot leave a button down.
+static void flush_due_releases(int out_fd, int force) {
+	long long now = now_us();
+	for (int i = 0; i < DEBOUNCE_TRACKED_BUTTONS; i++) {
+		pending_release_t* pending = &pending_releases[i];
+		if (!pending->active || (!force && now < pending->due_us)) {
+			continue;
+		}
+		pending->active = 0;
+		emit_button_event(out_fd, &pending->ev);
+		emit_syn_report(out_fd, &pending->ev);
+	}
+}
+
+// Returns 1 when the event has been dealt with and must not be forwarded.
+static int debounce_button_event(const struct input_event* ev) {
+	int slot = debounce_slot(ev);
+	if (slot < 0) {
+		return 0;
+	}
+	pending_release_t* pending = &pending_releases[slot];
+
+	if (ev->value == 0) {
+		// Hold it back; this may yet turn out to be chatter
+		pending->ev = *ev;
+		pending->due_us = event_time_us(ev) + (long long)CLICK_DEBOUNCE_MS * 1000LL;
+		pending->active = 1;
+		return 1;
+	}
+
+	if (ev->value == 1 && pending->active) {
+		// Back down inside the window, so it never really came up
+		long long released_us = pending->due_us - (long long)CLICK_DEBOUNCE_MS * 1000LL;
+		fprintf(stderr, "Debounce: swallowed bounce on button 0x%x, %lld ms after release\n",
+			ev->code, (event_time_us(ev) - released_us) / 1000);
+		pending->active = 0;
+		return 1;
+	}
+
+	return 0;
+}
+
 void* mouse_thread_io_func(void* args_void) {
 	mouse_thread_args_t* args = (mouse_thread_args_t*)args_void;
 
@@ -392,9 +482,33 @@ void* mouse_thread_io_func(void* args_void) {
 	// Read events in a loop
 	int consecutive_failures = 0;
 	while (1) {
+		// Wait for input, waking early if a held-back release falls due.
+		// A blocking read would sit here indefinitely on an idle mouse and
+		// strand the release that ends a click.
+		int timeout_ms = -1;
+		long long due_us = next_release_due_us();
+		if (due_us >= 0) {
+			long long remaining_us = due_us - now_us();
+			timeout_ms = remaining_us > 0 ? (int)((remaining_us + 999) / 1000) : 0;
+		}
+
+		struct pollfd pfd = { .fd = mouse_fd, .events = POLLIN, .revents = 0 };
+		int ready = poll(&pfd, 1, timeout_ms);
+		if (ready < 0 && errno == EINTR) {
+			continue;
+		}
+
+		// A press arriving in this same wake-up is still inside its window,
+		// so it gets to cancel the release before this flush can see it.
+		flush_due_releases(args->out_fd, 0);
+
+		if (ready == 0) {
+			continue; // Timed out: nothing to read, releases already flushed
+		}
+
 		// Read an event
 		struct input_event ev = {0};
-		ssize_t n = read(mouse_fd, &ev, ev_size);
+		ssize_t n = ready < 0 ? -1 : read(mouse_fd, &ev, ev_size);
 		if (n != ev_size) {
 			int err = errno;
 			fprintf(stderr, "Failed to read mouse event: read returned %zd bytes, errno=%d (%s)\n",
@@ -402,6 +516,10 @@ void* mouse_thread_io_func(void* args_void) {
 			fprintf(stderr, "  Mouse fd=%d, is_valid=%d, consecutive_failures=%d\n", 
 				mouse_fd, is_fd_valid(mouse_fd), consecutive_failures);
 			
+			// Let go of anything held back before the device goes away,
+			// or a button caught mid-window would stay down forever
+			flush_due_releases(args->out_fd, 1);
+
 			// Always try to reopen on any read error
 			if (reopen_device(&mouse_fd, args->vendor_id, args->model_id, "mouse") == 0) {
 				consecutive_failures = 0;
@@ -422,23 +540,11 @@ void* mouse_thread_io_func(void* args_void) {
 		{
 		case EV_KEY:
 		{
-			// Drop switch bounce before the button is mapped or forwarded
-			if (is_button_bounce(&ev)) {
+			// Defer releases and swallow bounce before anything is forwarded
+			if (debounce_button_event(&ev)) {
 				break;
 			}
-
-			// Only send mapped side buttons to keyboard, forward others to mouse
-			int mapped_key = mapped_key_for_button(ev.code);
-			if (mapped_key) {
-				// Convert side buttons to modifier keys
-				ev.code = mapped_key;
-				send_input_event_to_keyboard(&ev);
-			} else {
-				ssize_t written = write(args->out_fd, &ev, ev_size);
-				if (written != ev_size) {
-					fprintf(stderr, "Failed to write mouse button event: wrote %zd/%zu bytes\n", written, ev_size);
-				}
-			}
+			emit_button_event(args->out_fd, &ev);
 		} break;
 		case EV_REL:
 		{

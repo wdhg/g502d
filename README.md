@@ -160,10 +160,24 @@ mouse has been open since boot and had learned it; the virtual device is
 destroyed and recreated on every daemon restart, so it starts naive and passes
 the bounce straight through.
 
-`CLICK_DEBOUNCE_MS` in `config.h` drops any press arriving less than that long
-after the *same button* was released, along with that press's matching release.
-The window measures release-to-press, which was 22-30 ms for the bounce, while
-genuine repeat clicks were 672-3965 ms apart - two orders of magnitude of margin.
+The same switch also chatters the other way, flicking open for a moment while
+the button is still held. That reaches the host as the end of a drag.
+
+Both faults are the same event pair - a release followed closely by a press -
+and at the moment the release arrives there is no way to tell it from a real
+one. So `CLICK_DEBOUNCE_MS` in `config.h` holds every release back for that
+long. If the button goes down again inside the window, the release is cancelled
+and the press is swallowed: the host never sees the button come up, which is
+what actually happened in both cases.
+
+Dropping the *press* instead is the obvious implementation and it does fix
+double clicks, but it breaks drags - the spurious release has already gone out,
+the recovery press gets eaten as bounce, and the button is left stuck up.
+
+Measured bounce sat at 22-30 ms from the edge, against 672-3965 ms between
+genuine repeat clicks, so the window has two orders of magnitude of room. The
+cost is up to `CLICK_DEBOUNCE_MS` of latency on release; presses are never
+delayed.
 
 Every drop is logged, so the journal tells you the real bounce rate and whether
 the window needs adjusting:

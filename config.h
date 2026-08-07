@@ -39,15 +39,18 @@
 // DPI scaling factor (for converting G502 DPI to OS cursor speed)
 #define DPI_SCALE 0.5
 
-// Contact bounce window, in milliseconds. A button press arriving less than
-// this long after that same button was released is treated as a worn switch
-// bouncing rather than a real click, and is dropped. Set to 0 to disable.
+// Contact bounce window, in milliseconds. Button releases are held back this
+// long; if the button goes down again before the window expires, the release
+// and the new press are both discarded, because the button never really came
+// up. Set to 0 to disable. See the comment above pending_releases in g502d.c.
 //
-// This trades away the ability to click faster than the window. 40 ms allows
-// 25 clicks per second, which is well beyond a human; measured bounce on this
-// mouse landed around 30 ms, so raise it if doubles still get through and
-// lower it if genuine fast clicks go missing. Drops are logged to stderr
-// (journalctl --user -u g502d), so the log tells you which is happening.
+// The cost is up to this much latency on every button release, so keep it as
+// small as the hardware allows. Measured bounce on this mouse sat at 22-30 ms
+// from the edge; genuine repeat clicks were hundreds of milliseconds apart, so
+// there is a lot of room between the two. Raise it if doubles or dropped drags
+// still get through, lower it if releases feel sluggish. Every suppressed
+// bounce is logged (journalctl --user -u g502d), so the log tells you the real
+// bounce rate rather than leaving you to guess.
 #define CLICK_DEBOUNCE_MS 40
 
 #endif // CONFIG_H
