@@ -52,6 +52,61 @@ static int mapped_scan_for_scan(int mouse_scan) {
 	}
 }
 
+// Suppress contact bounce from a worn microswitch.
+//
+// A tired switch can re-close for a few tens of milliseconds after you let go,
+// as the leaf springs back through the contact point. The host sees a complete,
+// plausible second press - our G502 produced 22 ms presses 30 ms after release -
+// and apps read it as a double click. Genuine repeat clicks are hundreds of
+// milliseconds apart, so a short window after each release separates the two
+// cleanly.
+//
+// A dropped press also drops its matching release, or the host would be left
+// holding a button that never went down. Suppressed releases still update the
+// timestamp so a run of several bounces is eaten rather than just the first.
+#define DEBOUNCE_TRACKED_BUTTONS 16
+
+static long long event_time_us(const struct input_event* ev) {
+	return (long long)ev->time.tv_sec * 1000000LL + (long long)ev->time.tv_usec;
+}
+
+// Returns 1 when the event is bounce and should be dropped.
+static int is_button_bounce(const struct input_event* ev) {
+	static long long last_release_us[DEBOUNCE_TRACKED_BUTTONS] = {0};
+	static int dropped_press[DEBOUNCE_TRACKED_BUTTONS] = {0};
+
+	if (CLICK_DEBOUNCE_MS <= 0) {
+		return 0;
+	}
+
+	int slot = ev->code - BTN_MOUSE;
+	if (slot < 0 || slot >= DEBOUNCE_TRACKED_BUTTONS) {
+		return 0; // Not a mouse button, nothing to debounce
+	}
+
+	const long long now = event_time_us(ev);
+	const long long window_us = (long long)CLICK_DEBOUNCE_MS * 1000LL;
+
+	if (ev->value == 1) {
+		long long since = now - last_release_us[slot];
+		if (last_release_us[slot] != 0 && since >= 0 && since < window_us) {
+			dropped_press[slot] = 1;
+			fprintf(stderr, "Debounce: dropped bounce on button 0x%x, %lld ms after release\n",
+				ev->code, since / 1000);
+			return 1;
+		}
+		dropped_press[slot] = 0;
+	} else if (ev->value == 0) {
+		last_release_us[slot] = now;
+		if (dropped_press[slot]) {
+			dropped_press[slot] = 0;
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
 // Helper function to get errno string
 static const char* get_errno_name(int err) {
 	switch (err) {
@@ -367,6 +422,11 @@ void* mouse_thread_io_func(void* args_void) {
 		{
 		case EV_KEY:
 		{
+			// Drop switch bounce before the button is mapped or forwarded
+			if (is_button_bounce(&ev)) {
+				break;
+			}
+
 			// Only send mapped side buttons to keyboard, forward others to mouse
 			int mapped_key = mapped_key_for_button(ev.code);
 			if (mapped_key) {

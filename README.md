@@ -138,6 +138,44 @@ This needs no flash write and is how you can see the paddle, the two DPI buttons
 profile-switch button. It only *observes* though - the on-device action still fires, so a
 paddle press would still change DPI. That is why the profile rewrite is the better fix.
 
+## Debouncing a worn switch
+
+The left switch on this mouse developed contact bounce: on **release**, the
+contacts re-close for a few tens of milliseconds as the leaf springs back, and
+the host reads that as a second click. Measured on `/dev/input/event2` with the
+daemon stopped, so this is the hardware, not the daemon:
+
+    48.071  up      held 300 ms      <- release
+    48.093  down    22 ms later      <- switch re-closes on its own
+    48.115  up      held 22 ms
+
+It is intermittent, it is tied to the release edge rather than to fast clicking
+(the press above was held 300 ms), and it is the classic failure mode of the
+D2FC-F-7N switches these mice use.
+
+It only became visible once this daemon was running. libinput does its own
+button debouncing and tightens its filter on a device once it has seen that
+device bounce, and it keeps that state while the device stays open. The physical
+mouse has been open since boot and had learned it; the virtual device is
+destroyed and recreated on every daemon restart, so it starts naive and passes
+the bounce straight through.
+
+`CLICK_DEBOUNCE_MS` in `config.h` drops any press arriving less than that long
+after the *same button* was released, along with that press's matching release.
+The window measures release-to-press, which was 22-30 ms for the bounce, while
+genuine repeat clicks were 672-3965 ms apart - two orders of magnitude of margin.
+
+Every drop is logged, so the journal tells you the real bounce rate and whether
+the window needs adjusting:
+
+    journalctl --user -u g502d -f | grep Debounce
+
+If real clicks start going missing, lower it. If doubles still get through,
+raise it. Setting it to 0 disables debouncing entirely.
+
+This is a workaround for failing hardware; the permanent fix is replacing the
+switch. Debouncing in software is what mouse firmware does anyway.
+
 ## Tools
 
 All of these talk to the mouse over `/dev/hidraw1` using HID++ 2.0. Every write path is
@@ -150,6 +188,8 @@ gated behind an explicit flag.
 | `tools/profile_backup.py` | Dump and inspect all 16 memory sectors |
 | `tools/button_spy.py` | Watch raw button state via feature `0x8110` |
 | `tools/hidraw_watch.py` | Capture raw HID reports from both interfaces |
+| `tools/clickcount.py` | Count press/release pairs on an evdev node, flag duplicates |
+| `tools/clicktest.html` | Same, but at the application layer - open it in a browser |
 
 ### Onboard profile format
 

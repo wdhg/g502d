@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>G502 click test</title>
+<style>
+  :root {
+    --bg: #14161a; --fg: #e7e9ee; --dim: #8b93a1;
+    --ok: #4ac47a; --bad: #ff5f5f; --warn: #ffb443; --line: #2a2f38;
+  }
+  @media (prefers-color-scheme: light) {
+    :root { --bg: #fbfbfd; --fg: #1b1e24; --dim: #666e7c; --line: #dfe3ea; }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px; background: var(--bg); color: var(--fg);
+    font: 15px/1.5 ui-sans-serif, system-ui, sans-serif;
+  }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  p.sub { color: var(--dim); margin: 0 0 20px; }
+  .grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+  .card { border: 1px solid var(--line); border-radius: 10px; padding: 16px; }
+  .card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .05em;
+             color: var(--dim); margin: 0 0 12px; font-weight: 600; }
+  #target {
+    height: 150px; display: grid; place-items: center; cursor: pointer;
+    border: 2px dashed var(--line); border-radius: 10px; user-select: none;
+    font-size: 15px; color: var(--dim);
+  }
+  #target:active { border-color: var(--ok); }
+  .verdict { font-size: 26px; font-weight: 700; margin: 0 0 6px; }
+  .verdict.ok { color: var(--ok); } .verdict.bad { color: var(--bad); }
+  .verdict.idle { color: var(--dim); }
+  .stat { display: flex; justify-content: space-between; padding: 4px 0;
+          border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+  .stat:last-child { border: 0; }
+  .stat span:last-child { font-weight: 600; }
+  #log { font: 12px/1.6 ui-monospace, monospace; max-height: 260px; overflow-y: auto;
+         white-space: pre; }
+  #log .dup { color: var(--bad); font-weight: 700; }
+  #log .hdr { color: var(--dim); }
+  button { font: inherit; padding: 6px 14px; border-radius: 6px; cursor: pointer;
+           border: 1px solid var(--line); background: transparent; color: var(--fg); }
+  .row { display: flex; gap: 8px; align-items: center; margin-top: 14px; flex-wrap: wrap; }
+  label { color: var(--dim); font-size: 13px; }
+  input[type=number] { width: 64px; font: inherit; padding: 4px 6px; border-radius: 6px;
+                       border: 1px solid var(--line); background: transparent; color: var(--fg); }
+</style>
+</head>
+<body>
+
+<h1>G502 click test</h1>
+<p class="sub">Click the box below <strong>once</strong>, slowly, a dozen or so times. Anything under the threshold is counted as a duplicate.</p>
+
+<div class="grid">
+  <div class="card">
+    <h2>Target</h2>
+    <div id="target">click me once</div>
+    <div class="row">
+      <button id="reset">Reset</button>
+      <label>threshold <input type="number" id="thresh" value="80" min="10" max="500"> ms</label>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Verdict</h2>
+    <p class="verdict idle" id="verdict">no data</p>
+    <div class="stat"><span>mousedown events</span><span id="n-down">0</span></div>
+    <div class="stat"><span>duplicates (&lt; threshold)</span><span id="n-dup">0</span></div>
+    <div class="stat"><span>dblclick fired</span><span id="n-dbl">0</span></div>
+    <div class="stat"><span>shortest gap</span><span id="t-min">–</span></div>
+    <div class="stat"><span>shortest press</span><span id="t-press">–</span></div>
+  </div>
+
+  <div class="card">
+    <h2>Event log</h2>
+    <div id="log"><span class="hdr">      time   event      gap   detail</span></div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const target = $('target'), log = $('log');
+
+let nDown = 0, nDup = 0, nDbl = 0;
+let lastDown = null, lastUp = null, minGap = null, minPress = null;
+let t0 = null;
+
+const ms = v => v === null ? '–' : v.toFixed(1) + ' ms';
+
+function line(cls, time, name, gap, detail) {
+  const el = document.createElement('div');
+  if (cls) el.className = cls;
+  el.textContent =
+    String(time.toFixed(1)).padStart(10) + '  ' +
+    name.padEnd(10) + ' ' +
+    (gap === null ? '     –' : gap.toFixed(1).padStart(6)) + '   ' + detail;
+  log.appendChild(el);
+  log.scrollTop = log.scrollHeight;
+}
+
+function render() {
+  $('n-down').textContent = nDown;
+  $('n-dup').textContent = nDup;
+  $('n-dbl').textContent = nDbl;
+  $('t-min').textContent = ms(minGap);
+  $('t-press').textContent = ms(minPress);
+
+  const v = $('verdict');
+  if (!nDown) { v.className = 'verdict idle'; v.textContent = 'no data'; }
+  else if (nDup) { v.className = 'verdict bad'; v.textContent = nDup + ' duplicate' + (nDup > 1 ? 's' : ''); }
+  else { v.className = 'verdict ok'; v.textContent = 'clean'; }
+}
+
+target.addEventListener('mousedown', e => {
+  if (e.button !== 0) return;
+  const t = e.timeStamp;
+  if (t0 === null) t0 = t;
+  const gap = lastDown === null ? null : t - lastDown;
+  const dup = gap !== null && gap < Number($('thresh').value);
+
+  nDown++;
+  if (dup) nDup++;
+  if (gap !== null && (minGap === null || gap < minGap)) minGap = gap;
+
+  line(dup ? 'dup' : '', t - t0, 'down', gap,
+       dup ? 'DUPLICATE — no human clicks this fast' : 'press ' + nDown);
+  lastDown = t;
+  render();
+});
+
+target.addEventListener('mouseup', e => {
+  if (e.button !== 0) return;
+  const t = e.timeStamp;
+  const press = lastDown === null ? null : t - lastDown;
+  if (press !== null && (minPress === null || press < minPress)) minPress = press;
+  line('', t - t0, 'up', press, press === null ? '' : 'held ' + press.toFixed(0) + ' ms');
+  lastUp = t;
+  render();
+});
+
+target.addEventListener('dblclick', e => {
+  nDbl++;
+  line('dup', e.timeStamp - t0, 'dblclick', null, 'browser saw a DOUBLE CLICK');
+  render();
+});
+
+target.addEventListener('contextmenu', e => e.preventDefault());
+
+$('reset').addEventListener('click', e => {
+  e.stopPropagation();
+  nDown = nDup = nDbl = 0;
+  lastDown = lastUp = minGap = minPress = t0 = null;
+  log.innerHTML = '<span class="hdr">      time   event      gap   detail</span>';
+  render();
+});
+
+render();
+</script>
+</body>
+</html>
