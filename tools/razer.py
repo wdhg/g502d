@@ -60,6 +60,22 @@ CMD_SET_BINDING = 0x0C
 CMD_GET_BINDING = 0x8C
 BINDING_ARG_SIZE = 10  # profile, slot, hypershift, + 7-byte function block
 
+# Status reads. These are the same commands openrazer's kernel driver uses on
+# this device, so unlike the button-assignment class they are well established.
+CLASS_MISC = 0x00
+CMD_GET_POLLING_RATE = 0x85
+CLASS_DPI = 0x04
+CMD_GET_DPI = 0x85
+CLASS_POWER = 0x07
+CMD_GET_BATTERY = 0x80
+CMD_GET_CHARGING = 0x84
+
+# arguments[0] of a DPI read: 0x00 reads the live value, 0x01 the stored one.
+DPI_NOSTORE = 0x00
+DPI_VARSTORE = 0x01
+
+POLLING_RATES = {0x01: 1000, 0x02: 500, 0x08: 125}
+
 # Function block classes, from OpenSnek Sources/OpenSnekCore/ButtonBindingSupport.swift
 FUNCTION_CLASSES = {
     0x00: "disabled",
@@ -228,6 +244,34 @@ class Device:
         raw = response[ARGUMENTS:ARGUMENTS + 22]
         return raw.split(b"\x00")[0].decode("ascii", "replace")
 
+    def battery_percent(self):
+        """Charge as a percentage, or None if the device does not report one."""
+        response = self.request(CLASS_POWER, CMD_GET_BATTERY, bytes(2))
+        raw = response[ARGUMENTS + 1]
+        # A wired-only mouse answers 0; treat that as "no battery" rather than
+        # reporting a flat one.
+        return round(raw * 100 / 255) if raw else None
+
+    def is_charging(self):
+        response = self.request(CLASS_POWER, CMD_GET_CHARGING, bytes(2))
+        return bool(response[ARGUMENTS + 1])
+
+    def dpi(self):
+        """(x, y) DPI. Falls back to the stored value if the live read fails."""
+        for store in (DPI_NOSTORE, DPI_VARSTORE):
+            try:
+                response = self.request(CLASS_DPI, CMD_GET_DPI, bytes([store]) + bytes(6))
+            except RazerError:
+                continue
+            args = response[ARGUMENTS:ARGUMENTS + 5]
+            return (args[1] << 8) | args[2], (args[3] << 8) | args[4]
+        raise RazerError("could not read DPI")
+
+    def polling_rate(self):
+        """Reports in Hz. Returns None for a rate this command cannot express."""
+        response = self.request(CLASS_MISC, CMD_GET_POLLING_RATE, bytes(1))
+        return POLLING_RATES.get(response[ARGUMENTS])
+
     def read_binding(self, slot, profile=1, hypershift=0):
         args = bytes([profile, slot, hypershift]) + bytes(7)
         response = self.request(CLASS_BUTTON, CMD_GET_BINDING, args)
@@ -288,6 +332,41 @@ def cmd_info(dev, _args):
     major, minor = dev.firmware_version()
     print(f"firmware: v{major}.{minor}")
     print(f"serial: {dev.serial()}")
+
+
+def cmd_status(dev, args):
+    """Everything the mouse will tell us about itself."""
+    stats = {}
+    for name, getter in (("firmware", lambda: "v%d.%d" % dev.firmware_version()),
+                         ("serial", dev.serial),
+                         ("battery_percent", dev.battery_percent),
+                         ("charging", dev.is_charging),
+                         ("dpi", dev.dpi),
+                         ("polling_rate_hz", dev.polling_rate)):
+        try:
+            stats[name] = getter()
+        except RazerError as exc:
+            stats[name] = None
+            if args.verbose:
+                print(f"  {name}: {exc}", file=sys.stderr)
+
+    if args.json:
+        print(json.dumps(stats))
+        return
+
+    print(f"device:   {dev.path}")
+    print(f"firmware: {stats['firmware'] or 'unknown'}")
+    print(f"serial:   {stats['serial'] or 'unknown'}")
+    if stats["battery_percent"] is None:
+        print("battery:  not reported (wired-only or unsupported)")
+    else:
+        print(f"battery:  {stats['battery_percent']}%"
+              f"{' (charging)' if stats['charging'] else ''}")
+    if stats["dpi"]:
+        x, y = stats["dpi"]
+        print(f"dpi:      {x}" + (f" x {y}" if x != y else ""))
+    if stats["polling_rate_hz"]:
+        print(f"polling:  {stats['polling_rate_hz']} Hz")
 
 
 def cmd_read(dev, args):
@@ -400,6 +479,10 @@ def main():
     sub.add_parser("info", parents=[common],
                    help="firmware and serial - proves the transport works")
 
+    p = sub.add_parser("status", parents=[common],
+                       help="battery, DPI, polling rate and firmware")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+
     p = sub.add_parser("read", parents=[common], help="read one button slot")
     p.add_argument("slot", type=lambda s: int(s, 0))
 
@@ -423,7 +506,7 @@ def main():
     p.add_argument("path")
 
     args = parser.parse_args()
-    handlers = {"info": cmd_info, "read": cmd_read, "dump": cmd_dump,
+    handlers = {"info": cmd_info, "status": cmd_status, "read": cmd_read, "dump": cmd_dump,
                 "backup": cmd_backup, "set-key": cmd_set_key, "restore": cmd_restore}
 
     try:

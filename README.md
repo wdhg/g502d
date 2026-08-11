@@ -302,6 +302,80 @@ raise it. Setting it to 0 disables debouncing entirely.
 This is a workaround for failing hardware; the permanent fix is replacing the
 switch. Debouncing in software is what mouse firmware does anyway.
 
+## Status bar module
+
+`tools/waybar-status.py` is a waybar module reporting battery, DPI, polling rate and -
+the part `systemctl status` cannot tell you - whether input is actually being routed.
+
+The daemon only does anything while it holds an `EVIOCGRAB` on the physical devices. A
+daemon that is "active" but grabbing nothing looks healthy and does nothing, so the module
+reads the daemon's own open file descriptors (`/proc/<pid>/fd`, readable without root since
+it runs as your user) and lists exactly which devices are captured.
+
+| State | Meaning |
+| --- | --- |
+| `routed` | Holding grabs, virtual devices present - working |
+| `degraded` | Running, but capturing nothing; input reaches the compositor directly |
+| `off` | Service stopped |
+| `low` | Routed, battery at or below 15% |
+
+Left click toggles the daemon, right click opens the full status in a terminal. Both go
+through `tools/g502d-ctl.sh`, which also signals waybar to refresh rather than waiting for
+the next poll.
+
+    ./tools/waybar-status.py --plain      # what the tooltip shows
+    ./tools/razer.py status               # device stats on their own
+
+`install.sh` copies these into `~/.local/bin`. Reading battery and DPI needs hidraw access:
+
+    sudo cp udev/99-razer-hidraw.rules /etc/udev/rules.d/
+    sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=hidraw
+
+Without that rule everything else still works and the stats are simply omitted.
+
+The waybar side is two edits to `~/.config/waybar/`: a `custom/g502d` module pointing at
+`g502d-status`, and a few rules in `style.css`. Waybar does not auto-reload - run
+`omarchy restart waybar`.
+
+## Hotplug
+
+Devices are enumerated at startup *and* watched afterwards via a `sd_device_monitor` on the
+`input` subsystem. A keyboard connected later is grabbed as it appears; before this, it was
+ignored until the daemon was restarted, which mattered because a mouse that sends keystrokes
+presents itself as a keyboard.
+
+The keyboard registry is append-only, so pointers held by running threads stay valid as new
+entries arrive. Removal is already handled by each keyboard thread, which re-resolves its
+device node by syspath when a read fails.
+
+A missing mouse is no longer fatal at startup: the mouse thread waits for one of the
+configured devices to appear.
+
+## Wireless
+
+The Basilisk V3 Pro reports a **different USB product ID per connection mode**, so each mode
+you use has to be listed in `MOUSE_DEVICES`. Only wired `1532:00aa` is confirmed here.
+
+Device matching is deliberately not based on udev's `ID_USB_VENDOR_ID` / `ID_MODEL_ID`
+properties, because those exist only for USB devices - over Bluetooth the same mouse arrives
+on the bluetooth bus with no USB properties at all and would never be found. It matches the
+input device's own `id/vendor` and `id/product` sysattrs instead, which every bus populates:
+
+    cat /sys/class/input/event21/device/id/{vendor,product}
+
+So the daemon's side-button mapping and debouncing work over any transport, given the right
+IDs in the config. To find them for a mode you have not used yet, connect that way and run
+`lsusb`, or read the sysattrs above.
+
+The onboard button bindings live in the mouse, so the paddle keeps sending Left Alt over
+every transport regardless of any of this.
+
+**`tools/razer.py` is a different matter.** It talks to a USB HID control interface, so it
+works wired and over the 2.4GHz dongle but is unlikely to work over Bluetooth - openrazer
+does not support Bluetooth for these devices either. In practice that means battery and DPI
+in the status module, and any rebinding, need USB. Since rebinding is a one-off and persists
+in hardware, that is mostly a limitation on the stats.
+
 ## Tools
 
 All of these talk to the mouse over `/dev/hidraw1` using HID++ 2.0. Every write path is
@@ -315,7 +389,9 @@ gated behind an explicit flag.
 | `tools/button_spy.py` | Watch raw button state via feature `0x8110` |
 | `tools/hidraw_watch.py` | Capture raw HID reports from both interfaces |
 | `tools/identify_buttons.py` | Watch every interface of a device and name what each button sends |
-| `tools/razer.py` | Razer onboard protocol: read and rebind button slots |
+| `tools/razer.py` | Razer onboard protocol: status, read and rebind button slots |
+| `tools/waybar-status.py` | Waybar module: device stats and whether input is routed |
+| `tools/g502d-ctl.sh` | Toggle the daemon and refresh the bar |
 | `tools/clickcount.py` | Count press/release pairs on an evdev node, flag duplicates |
 | `tools/clicktest.html` | Same, but at the application layer - open it in a browser |
 

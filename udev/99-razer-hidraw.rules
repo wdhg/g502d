@@ -1,0 +1,13 @@
+# Let the desktop user read Razer HID control interfaces.
+#
+# The status module reads battery, DPI and polling rate over hidraw, which is
+# root-only by default. This grants the `input` group access instead of running
+# the bar as root. Mirrors the existing Logitech rule.
+#
+# Install:
+#   sudo cp udev/99-razer-hidraw.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=hidraw
+#
+# Read-only access would be enough for the status module, but rebinding buttons
+# with tools/razer.py needs write too, so this is 0660 rather than 0640.
+SUBSYSTEM=="hidraw", KERNEL=="hidraw*", ATTRS{idVendor}=="1532", GROUP="input", MODE="0660"

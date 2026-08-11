@@ -35,6 +35,23 @@ systemctl --user enable "$SERVICE_NAME"
 systemctl --user start "$SERVICE_NAME"
 echo "$SERVICE_NAME is now enabled and started."
 
+# Install the helper scripts the waybar module uses. razer.py goes alongside
+# g502d-status because the status module imports it for battery and DPI.
+echo "Installing helper scripts to $INSTALL_DIR..."
+cp tools/razer.py "$INSTALL_DIR/razer.py"
+cp tools/waybar-status.py "$INSTALL_DIR/g502d-status"
+cp tools/g502d-ctl.sh "$INSTALL_DIR/g502d-ctl"
+chmod +x "$INSTALL_DIR/razer.py" "$INSTALL_DIR/g502d-status" "$INSTALL_DIR/g502d-ctl"
+
+# Device stats need hidraw access, which is root-only by default.
+if [ ! -f /etc/udev/rules.d/99-razer-hidraw.rules ] && [ -f udev/99-razer-hidraw.rules ]; then
+	echo ""
+	echo "To read battery and DPI without root, install the udev rule:"
+	echo "  sudo cp udev/99-razer-hidraw.rules /etc/udev/rules.d/"
+	echo "  sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=hidraw"
+	echo ""
+fi
+
 echo "Wait a few seconds for the virtual devices to be created."
 sleep 5
 echo "Installation complete!"

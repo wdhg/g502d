@@ -25,8 +25,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/ioctl.h>
 #include <systemd/sd-device.h>
+#include <systemd/sd-event.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -152,39 +154,80 @@ static const struct {
 };
 #define KNOWN_MOUSE_COUNT (sizeof(known_mice) / sizeof(known_mice[0]))
 
-// Find the event node of the first configured mouse that is connected.
+// Find the event node of the highest-priority configured mouse that is present.
 //
-// Vendor and model alone are not enough to identify it. A gaming mouse presents
-// several event nodes under one USB ID - the Basilisk V3 Pro has four, of which
-// two are keyboards and one is a digitiser - and picking whichever udev returned
-// first would be a coin toss. ID_INPUT_MOUSE selects the pointer node.
+// Matching is on the input device's own id/vendor and id/product sysattrs rather
+// than on udev's ID_USB_VENDOR_ID / ID_MODEL_ID properties. Those properties only
+// exist for USB devices, so matching on them would find the mouse over the cable
+// and the 2.4GHz dongle but never over Bluetooth, where the same mouse arrives on
+// the bluetooth bus with no USB properties at all. The sysattrs are populated for
+// every bus.
+//
+// ID_INPUT_MOUSE picks the pointer node out of the several a gaming mouse
+// presents under one ID - the Basilisk V3 Pro has four, two of them keyboards.
 //
 // Returns a malloc'd path, or NULL when no configured mouse is present.
 static char* find_mouse_device(void) {
-	for (size_t i = 0; i < KNOWN_MOUSE_COUNT; i++) {
-		struct sd_device_enumerator *enumerator = NULL;
-		if (sd_device_enumerator_new(&enumerator) < 0) {
-			fprintf(stderr, "Failed to create device enumerator\n");
-			return NULL;
+	struct sd_device_enumerator *enumerator = NULL;
+	if (sd_device_enumerator_new(&enumerator) < 0) {
+		fprintf(stderr, "Failed to create device enumerator\n");
+		return NULL;
+	}
+
+	sd_device_enumerator_add_match_subsystem(enumerator, "input", 1);
+	sd_device_enumerator_add_match_sysname(enumerator, "event*");
+	sd_device_enumerator_add_match_property(enumerator, "ID_INPUT_MOUSE", "1");
+
+	char* best = NULL;
+	const char* best_label = NULL;
+	size_t best_rank = KNOWN_MOUSE_COUNT;
+
+	for (sd_device *device = sd_device_enumerator_get_device_first(enumerator);
+	     device;
+	     device = sd_device_enumerator_get_device_next(enumerator)) {
+		const char* syspath = NULL;
+		if (sd_device_get_syspath(device, &syspath) < 0) {
+			continue;
+		}
+		// Our own virtual mouse also has ID_INPUT_MOUSE.
+		if (strncmp(syspath, "/sys/devices/virtual/", 21) == 0) {
+			continue;
 		}
 
-		sd_device_enumerator_add_match_subsystem(enumerator, "input", 1);
-		sd_device_enumerator_add_match_sysname(enumerator, "event*");
-		sd_device_enumerator_add_match_property(enumerator, "ID_USB_VENDOR_ID", known_mice[i].vendor);
-		sd_device_enumerator_add_match_property(enumerator, "ID_MODEL_ID", known_mice[i].model);
-		sd_device_enumerator_add_match_property(enumerator, "ID_INPUT_MOUSE", "1");
-
-		sd_device *device = sd_device_enumerator_get_device_first(enumerator);
-		const char* devnode = NULL;
-		if (device && sd_device_get_devname(device, &devnode) >= 0) {
-			char* result = strdup(devnode);
-			sd_device_enumerator_unref(enumerator);
-			fprintf(stderr, "Mouse found: %s (%s:%s) at %s\n",
-				known_mice[i].label, known_mice[i].vendor,
-				known_mice[i].model, result);
-			return result;
+		sd_device *parent = NULL;
+		const char* vendor = NULL;
+		const char* product = NULL;
+		if (sd_device_get_parent(device, &parent) < 0 ||
+		    sd_device_get_sysattr_value(parent, "id/vendor", &vendor) < 0 ||
+		    sd_device_get_sysattr_value(parent, "id/product", &product) < 0) {
+			continue;
 		}
-		sd_device_enumerator_unref(enumerator);
+
+		// Only look at entries that could outrank what we already have, so the
+		// order in MOUSE_DEVICES decides which mouse wins when several are on.
+		for (size_t i = 0; i < best_rank; i++) {
+			if (strcasecmp(vendor, known_mice[i].vendor) != 0 ||
+			    strcasecmp(product, known_mice[i].model) != 0) {
+				continue;
+			}
+			const char* devnode = NULL;
+			if (sd_device_get_devname(device, &devnode) < 0) {
+				break;
+			}
+			free(best);
+			best = strdup(devnode);
+			best_rank = i;
+			best_label = known_mice[i].label;
+			break;
+		}
+	}
+
+	sd_device_enumerator_unref(enumerator);
+
+	if (best) {
+		fprintf(stderr, "Mouse found: %s (%s:%s) at %s\n", best_label,
+			known_mice[best_rank].vendor, known_mice[best_rank].model, best);
+		return best;
 	}
 
 	fprintf(stderr, "No configured mouse is connected. Looked for:\n");
@@ -192,7 +235,8 @@ static char* find_mouse_device(void) {
 		fprintf(stderr, "  %s:%s  %s\n", known_mice[i].vendor,
 			known_mice[i].model, known_mice[i].label);
 	}
-	fprintf(stderr, "Add yours to MOUSE_DEVICES in config.h; `lsusb` prints the IDs.\n");
+	fprintf(stderr, "Add yours to MOUSE_DEVICES in config.h; `lsusb` prints the IDs,\n");
+	fprintf(stderr, "or read id/vendor and id/product under /sys/class/input/eventN/device/.\n");
 	return NULL;
 }
 
@@ -205,6 +249,32 @@ typedef struct {
 	char devnode[64];
 	char name[128];
 } keyboard_device_t;
+
+// Populate a keyboard record from a udev device.
+static void fill_keyboard(sd_device* device, const char* syspath, const char* devnode,
+                          keyboard_device_t* kb) {
+	snprintf(kb->syspath, sizeof(kb->syspath), "%s", syspath);
+	snprintf(kb->devnode, sizeof(kb->devnode), "%s", devnode);
+
+	// NAME is quoted in udev's property list; strip the quotes for logging.
+	const char* name = NULL;
+	if (sd_device_get_property_value(device, "NAME", &name) < 0 || !name) {
+		sd_device *parent = NULL;
+		if (sd_device_get_parent(device, &parent) >= 0) {
+			sd_device_get_sysattr_value(parent, "name", &name);
+		}
+	}
+	if (name) {
+		size_t len = strlen(name);
+		if (len >= 2 && name[0] == '"' && name[len - 1] == '"') {
+			snprintf(kb->name, sizeof(kb->name), "%.*s", (int)(len - 2), name + 1);
+		} else {
+			snprintf(kb->name, sizeof(kb->name), "%s", name);
+		}
+	} else {
+		snprintf(kb->name, sizeof(kb->name), "%s", devnode);
+	}
+}
 
 // Find every real keyboard on the system.
 //
@@ -239,29 +309,7 @@ static int find_keyboard_devices(keyboard_device_t* out, int max) {
 			continue;
 		}
 
-		keyboard_device_t* kb = &out[count];
-		snprintf(kb->syspath, sizeof(kb->syspath), "%s", syspath);
-		snprintf(kb->devnode, sizeof(kb->devnode), "%s", devnode);
-
-		// NAME is quoted in udev's property list; strip the quotes for logging.
-		const char* name = NULL;
-		if (sd_device_get_property_value(device, "NAME", &name) < 0 || !name) {
-			sd_device *parent = NULL;
-			if (sd_device_get_parent(device, &parent) >= 0) {
-				sd_device_get_sysattr_value(parent, "name", &name);
-			}
-		}
-		if (name) {
-			size_t len = strlen(name);
-			if (len >= 2 && name[0] == '"' && name[len - 1] == '"') {
-				snprintf(kb->name, sizeof(kb->name), "%.*s", (int)(len - 2), name + 1);
-			} else {
-				snprintf(kb->name, sizeof(kb->name), "%s", name);
-			}
-		} else {
-			snprintf(kb->name, sizeof(kb->name), "%s", devnode);
-		}
-
+		fill_keyboard(device, syspath, devnode, &out[count]);
 		count++;
 	}
 
@@ -282,6 +330,15 @@ static int refresh_keyboard_devnode(keyboard_device_t* kb) {
 	}
 	return -1;
 }
+
+// Keyboards the daemon has taken over, and the thread reading each one.
+//
+// Entries are only ever appended, never moved or removed, so the pointer handed
+// to a running thread stays valid as hotplugged keyboards are added alongside it.
+static keyboard_device_t keyboards[MAX_KEYBOARDS];
+static pthread_t keyboard_threads[MAX_KEYBOARDS];
+static int keyboard_count = 0;
+static pthread_mutex_t keyboards_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // Helper function to open and grab an input device
 static int open_and_grab_device(const char* device_path, const char* device_name) {
@@ -319,6 +376,21 @@ static void release_and_close_device(int fd, const char* device_name) {
 		ioctl(fd, EVIOCGRAB, 0);
 		close(fd);
 		fprintf(stderr, "Released and closed %s device (fd=%d)\n", device_name, fd);
+	}
+}
+
+// Block until a configured mouse shows up. The daemon is useful the moment one
+// is plugged in, so starting without one is a wait rather than an error.
+static int wait_for_mouse(void) {
+	for (int attempt = 0; ; attempt++) {
+		int fd = find_open_and_grab_mouse();
+		if (fd >= 0) {
+			return fd;
+		}
+		if (attempt == 0) {
+			fprintf(stderr, "Waiting for a configured mouse to be connected...\n");
+		}
+		sleep(2);
 	}
 }
 
@@ -494,11 +566,7 @@ void* mouse_thread_io_func(void* args_void) {
 	mouse_thread_args_t* args = (mouse_thread_args_t*)args_void;
 
 	// Find, open and grab the mouse event device
-	int mouse_fd = find_open_and_grab_mouse();
-	if (mouse_fd < 0)
-	{
-		pthread_exit(NULL);
-	}
+	int mouse_fd = wait_for_mouse();
 
 	// Accumulators for scaled movement
 	float accum_x = 0.0;
@@ -726,28 +794,129 @@ void* keyboard_process_o(void* args_void) {
 
 
 
+// Take over a keyboard and start reading it, unless we already are.
+// Safe to call from the udev monitor thread while other keyboard threads run.
+static void add_keyboard(const keyboard_device_t* found) {
+	pthread_mutex_lock(&keyboards_mutex);
+
+	for (int i = 0; i < keyboard_count; i++) {
+		if (strcmp(keyboards[i].syspath, found->syspath) == 0) {
+			pthread_mutex_unlock(&keyboards_mutex);
+			return; // Already ours
+		}
+	}
+	if (keyboard_count >= MAX_KEYBOARDS) {
+		fprintf(stderr, "Ignoring keyboard %s: already tracking %d\n",
+			found->name, MAX_KEYBOARDS);
+		pthread_mutex_unlock(&keyboards_mutex);
+		return;
+	}
+
+	keyboards[keyboard_count] = *found;
+	if (pthread_create(&keyboard_threads[keyboard_count], NULL,
+	                   keyboard_process_i, &keyboards[keyboard_count]) != 0) {
+		fprintf(stderr, "Failed to create input thread for keyboard %s\n", found->name);
+		pthread_mutex_unlock(&keyboards_mutex);
+		return;
+	}
+	keyboard_count++;
+
+	pthread_mutex_unlock(&keyboards_mutex);
+}
+
+// udev callback: pick up keyboards plugged in after startup.
+static int on_input_device_event(sd_device_monitor* monitor, sd_device* device, void* userdata) {
+	(void)monitor;
+	(void)userdata;
+
+	sd_device_action_t action;
+	if (sd_device_get_action(device, &action) < 0 || action != SD_DEVICE_ADD) {
+		return 0; // Removals are handled by the keyboard threads themselves
+	}
+
+	const char* sysname = NULL;
+	if (sd_device_get_sysname(device, &sysname) < 0 || strncmp(sysname, "event", 5) != 0) {
+		return 0;
+	}
+
+	const char* keyboard = NULL;
+	if (sd_device_get_property_value(device, "ID_INPUT_KEYBOARD", &keyboard) < 0 ||
+	    strcmp(keyboard, "1") != 0) {
+		return 0;
+	}
+
+	const char* syspath = NULL;
+	const char* devnode = NULL;
+	if (sd_device_get_syspath(device, &syspath) < 0 ||
+	    sd_device_get_devname(device, &devnode) < 0) {
+		return 0;
+	}
+	// Never grab our own output; see find_keyboard_devices().
+	if (strncmp(syspath, "/sys/devices/virtual/", 21) == 0) {
+		return 0;
+	}
+
+	keyboard_device_t kb;
+	memset(&kb, 0, sizeof(kb));
+	fill_keyboard(device, syspath, devnode, &kb);
+	fprintf(stderr, "Keyboard connected: %s (%s)\n", kb.name, kb.devnode);
+	add_keyboard(&kb);
+	return 0;
+}
+
+// Watch udev for input devices appearing.
+//
+// Enumeration only happens once at startup, so without this a keyboard plugged
+// in later is never grabbed and its keys bypass the virtual keyboard entirely -
+// which for a mouse that sends keystrokes means its side buttons stop working
+// as modifiers until the daemon is restarted.
+static void* device_monitor_thread(void* unused) {
+	(void)unused;
+
+	sd_event* event = NULL;
+	sd_device_monitor* monitor = NULL;
+
+	if (sd_event_new(&event) < 0) {
+		fprintf(stderr, "Failed to create event loop for device monitor\n");
+		pthread_exit(NULL);
+	}
+	if (sd_device_monitor_new(&monitor) < 0) {
+		fprintf(stderr, "Failed to create device monitor\n");
+		sd_event_unref(event);
+		pthread_exit(NULL);
+	}
+	if (sd_device_monitor_filter_add_match_subsystem_devtype(monitor, "input", NULL) < 0 ||
+	    sd_device_monitor_attach_event(monitor, event) < 0 ||
+	    sd_device_monitor_start(monitor, on_input_device_event, NULL) < 0) {
+		fprintf(stderr, "Failed to start device monitor\n");
+		sd_device_monitor_unref(monitor);
+		sd_event_unref(event);
+		pthread_exit(NULL);
+	}
+
+	fprintf(stderr, "Watching for input devices\n");
+	sd_event_loop(event);
+
+	sd_device_monitor_unref(monitor);
+	sd_event_unref(event);
+	pthread_exit(NULL);
+}
+
 int main()
 {
 	fprintf(stderr, "Starting G502 daemon...\n");
 	sleep(1);
 
-	char* mouse_event_device_path = find_mouse_device();
-	if (!mouse_event_device_path) {
-		return 1;
-	}
-	free(mouse_event_device_path);
+	// Not fatal if absent: the mouse thread waits for one to be connected.
+	free(find_mouse_device());
 
 	// Discover every keyboard on the system. This must happen before the virtual
 	// keyboard is created, otherwise we would find and then grab our own output.
-	keyboard_device_t keyboards[MAX_KEYBOARDS];
-	int keyboard_count = find_keyboard_devices(keyboards, MAX_KEYBOARDS);
-	if (keyboard_count == 0) {
-		fprintf(stderr, "No keyboards found\n");
-		return 1;
-	}
-	fprintf(stderr, "Found %d keyboard%s:\n", keyboard_count, keyboard_count == 1 ? "" : "s");
-	for (int i = 0; i < keyboard_count; i++) {
-		fprintf(stderr, "  %s (%s)\n", keyboards[i].name, keyboards[i].devnode);
+	keyboard_device_t found[MAX_KEYBOARDS];
+	int found_count = find_keyboard_devices(found, MAX_KEYBOARDS);
+	fprintf(stderr, "Found %d keyboard%s:\n", found_count, found_count == 1 ? "" : "s");
+	for (int i = 0; i < found_count; i++) {
+		fprintf(stderr, "  %s (%s)\n", found[i].name, found[i].devnode);
 	}
 
 	// Now we have verified the devices exist, create the virtual devices
@@ -878,23 +1047,15 @@ int main()
 
 	// Start one INPUT thread per keyboard. They share the event buffer, which is
 	// what merges every keyboard into the single virtual keyboard.
-	pthread_t kb_input_threads[MAX_KEYBOARDS];
-	int kb_threads_started = 0;
-	for (int i = 0; i < keyboard_count; i++) {
-		if (pthread_create(&kb_input_threads[kb_threads_started], NULL,
-		                   keyboard_process_i, &keyboards[i]) != 0) {
-			fprintf(stderr, "Failed to create input thread for keyboard %s\n",
-				keyboards[i].name);
-			continue;
-		}
-		kb_threads_started++;
+	for (int i = 0; i < found_count; i++) {
+		add_keyboard(&found[i]);
 	}
-	if (kb_threads_started == 0) {
-		fprintf(stderr, "Failed to create any keyboard input threads\n");
-		sem_destroy(&kb_event_sem);
-		close(v_kb_fd);
-		close(v_g502_fd);
-		return 1;
+
+	// Pick up keyboards connected later. Enumeration above happens once, so
+	// without this a keyboard plugged in afterwards is never grabbed.
+	pthread_t monitor_thread;
+	if (pthread_create(&monitor_thread, NULL, device_monitor_thread, NULL) != 0) {
+		fprintf(stderr, "Failed to start device monitor; hotplug will not work\n");
 	}
 
 	// Start mouse IO thread
@@ -911,10 +1072,9 @@ int main()
 	}
 
 	// Wait for threads to finish (they won't, this is just to keep the main thread alive)
+	// Keyboard threads are not joined: the set grows at runtime, and none of
+	// these ever return anyway.
 	pthread_join(mouse_io_thread, NULL);
-	for (int i = 0; i < kb_threads_started; i++) {
-		pthread_join(kb_input_threads[i], NULL);
-	}
 	pthread_join(kb_output_thread, NULL);
 
 	// Cleanup and exit
