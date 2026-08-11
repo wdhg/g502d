@@ -1,11 +1,23 @@
 # G502 Daemon
 
-This repository contains a Linux daemon for mapping the Logitech G502 side buttons to keyboard modifiers.
+This repository contains a Linux daemon for mapping gaming-mouse side buttons to keyboard
+modifiers, so they can modify keyboard input under Wayland.
 
-Developed against a **G502 Proteus Spectrum** (USB `046d:c332`, firmware `U1 03.02`, which
-reports its own name as "Tunable RGB Gaming Mouse G502"). The G502 Hero is a different USB
-ID (`046d:c08b`); the button layout is the same but none of the memory offsets below have
-been checked on one.
+Mice are listed in `MOUSE_DEVICES` in `config.h` and tried in order; the first one connected
+wins. Two are set up:
+
+| Mouse | USB ID | Working side buttons |
+| --- | --- | --- |
+| Razer Basilisk V3 Pro | `1532:00aa` wired | 2 of 3 - see below |
+| G502 Proteus Spectrum | `046d:c332` | 3 of 3, after an onboard rebind |
+
+The G502 work was done against a **Proteus Spectrum** (firmware `U1 03.02`, which reports its
+own name as "Tunable RGB Gaming Mouse G502"). The G502 Hero is a different USB ID
+(`046d:c08b`); the button layout is the same but none of the memory offsets below have been
+checked on one.
+
+Only one mouse is driven at a time. A second connected mouse keeps working as an ordinary
+pointer - it just does not get the side-button mapping or the debouncing.
 
 ## Installation
 
@@ -138,6 +150,41 @@ This needs no flash write and is how you can see the paddle, the two DPI buttons
 profile-switch button. It only *observes* though - the on-device action still fires, so a
 paddle press would still change DPI. That is why the profile rewrite is the better fix.
 
+## The Razer Basilisk V3 Pro
+
+Its two thumb buttons report the same HID usages as the G502's - `0x00090004` as `BTN_SIDE`
+and `0x00090005` as `BTN_EXTRA` - so `MODIFIER_BUTTON_MAP` drives them unchanged, giving
+Left Shift and Left Ctrl.
+
+The sniper paddle sends nothing, on any of its four interfaces. As on the G502, the firmware
+is consuming it: by default it is bound to Razer's "Sensitivity Clutch", which is handled
+inside the mouse. Verify with:
+
+    ./tools/identify_buttons.py razer
+
+**The G502 fix does not transfer.** There we rebound the paddle to HID mouse button 6, which
+worked because the G502's descriptor already declared sixteen buttons. The Basilisk's mouse
+interface declares five:
+
+    B: KEY=1f0000      # BTN_LEFT, BTN_RIGHT, BTN_MIDDLE, BTN_SIDE, BTN_EXTRA
+
+The kernel builds that bitmap from the HID report descriptor, so the mouse *cannot* report a
+sixth button whatever the onboard profile says. The paddle has to be bound to a **keyboard
+key** instead, which the mouse emits on its keyboard interface (`event22`/`event23`).
+
+Convenient side effect: a key from a keyboard interface is a real keypress as far as Wayland
+is concerned, so binding the paddle straight to Left Alt works with or without this daemon.
+The daemon grabs those interfaces and forwards them anyway, so it behaves the same either way.
+
+Setting that binding needs Razer's onboard protocol, which is not HID++ and is not covered by
+the tools here. Two routes:
+
+- **Razer Synapse on Windows**, saving to *onboard memory* rather than a cloud profile. The
+  binding then lives in the mouse and persists on Linux.
+- **Reverse-engineer it**, as was done for HID++. Razer uses 90-byte HID feature reports;
+  `openrazer` implements lighting, DPI and polling rate, but not general button remapping for
+  this model, so this is real work rather than a config change.
+
 ## Debouncing a worn switch
 
 The left switch on this mouse developed contact bounce: on **release**, the
@@ -202,6 +249,7 @@ gated behind an explicit flag.
 | `tools/profile_backup.py` | Dump and inspect all 16 memory sectors |
 | `tools/button_spy.py` | Watch raw button state via feature `0x8110` |
 | `tools/hidraw_watch.py` | Capture raw HID reports from both interfaces |
+| `tools/identify_buttons.py` | Watch every interface of a device and name what each button sends |
 | `tools/clickcount.py` | Count press/release pairs on an evdev node, flag duplicates |
 | `tools/clicktest.html` | Same, but at the application layer - open it in a browser |
 

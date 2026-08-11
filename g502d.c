@@ -140,34 +140,60 @@ static int is_fd_valid(int fd) {
 	return fcntl(fd, F_GETFD) >= 0;
 }
 
-// Helper function to find event device by vendor and model IDs
-static char* find_event_device(const char* vendor_id, const char* model_id, const char* device_name) {
-	struct sd_device_enumerator *enumerator = NULL;
-	int r = sd_device_enumerator_new(&enumerator);
-	if (r < 0) {
-		fprintf(stderr, "Failed to create device enumerator for %s\n", device_name);
-		return NULL;
-	}
+// The mice from config.h, in the order they should be tried.
+static const struct {
+	const char* vendor;
+	const char* model;
+	const char* label;
+} known_mice[] = {
+#define X(vendor, model, label) { vendor, model, label },
+	MOUSE_DEVICES
+#undef X
+};
+#define KNOWN_MOUSE_COUNT (sizeof(known_mice) / sizeof(known_mice[0]))
 
-	sd_device_enumerator_add_match_subsystem(enumerator, "input", 1);
-	sd_device_enumerator_add_match_sysname(enumerator, "event*");
-	sd_device_enumerator_add_match_property(enumerator, "ID_USB_VENDOR_ID", vendor_id);
-	sd_device_enumerator_add_match_property(enumerator, "ID_MODEL_ID", model_id);
+// Find the event node of the first configured mouse that is connected.
+//
+// Vendor and model alone are not enough to identify it. A gaming mouse presents
+// several event nodes under one USB ID - the Basilisk V3 Pro has four, of which
+// two are keyboards and one is a digitiser - and picking whichever udev returned
+// first would be a coin toss. ID_INPUT_MOUSE selects the pointer node.
+//
+// Returns a malloc'd path, or NULL when no configured mouse is present.
+static char* find_mouse_device(void) {
+	for (size_t i = 0; i < KNOWN_MOUSE_COUNT; i++) {
+		struct sd_device_enumerator *enumerator = NULL;
+		if (sd_device_enumerator_new(&enumerator) < 0) {
+			fprintf(stderr, "Failed to create device enumerator\n");
+			return NULL;
+		}
 
-	sd_device *device = sd_device_enumerator_get_device_first(enumerator);
-	if (!device) {
-		fprintf(stderr, "%s device not found\n", device_name);
+		sd_device_enumerator_add_match_subsystem(enumerator, "input", 1);
+		sd_device_enumerator_add_match_sysname(enumerator, "event*");
+		sd_device_enumerator_add_match_property(enumerator, "ID_USB_VENDOR_ID", known_mice[i].vendor);
+		sd_device_enumerator_add_match_property(enumerator, "ID_MODEL_ID", known_mice[i].model);
+		sd_device_enumerator_add_match_property(enumerator, "ID_INPUT_MOUSE", "1");
+
+		sd_device *device = sd_device_enumerator_get_device_first(enumerator);
+		const char* devnode = NULL;
+		if (device && sd_device_get_devname(device, &devnode) >= 0) {
+			char* result = strdup(devnode);
+			sd_device_enumerator_unref(enumerator);
+			fprintf(stderr, "Mouse found: %s (%s:%s) at %s\n",
+				known_mice[i].label, known_mice[i].vendor,
+				known_mice[i].model, result);
+			return result;
+		}
 		sd_device_enumerator_unref(enumerator);
-		return NULL;
 	}
 
-	const char* device_path = NULL;
-	sd_device_get_devname(device, &device_path);
-	char* result = strdup(device_path);
-	sd_device_enumerator_unref(enumerator);
-	
-	fprintf(stderr, "%s device found: %s\n", device_name, result);
-	return result;
+	fprintf(stderr, "No configured mouse is connected. Looked for:\n");
+	for (size_t i = 0; i < KNOWN_MOUSE_COUNT; i++) {
+		fprintf(stderr, "  %s:%s  %s\n", known_mice[i].vendor,
+			known_mice[i].model, known_mice[i].label);
+	}
+	fprintf(stderr, "Add yours to MOUSE_DEVICES in config.h; `lsusb` prints the IDs.\n");
+	return NULL;
 }
 
 // A keyboard the daemon has taken over.
@@ -274,14 +300,14 @@ static int open_and_grab_device(const char* device_path, const char* device_name
 	return fd;
 }
 
-// Helper function to find, open and grab an input device by vendor and model IDs
-static int find_open_and_grab_device(const char* vendor_id, const char* model_id, const char* device_name) {
-	char* device_path = find_event_device(vendor_id, model_id, device_name);
+// Helper function to find, open and grab the mouse
+static int find_open_and_grab_mouse(void) {
+	char* device_path = find_mouse_device();
 	if (!device_path) {
 		return -1;
 	}
 	
-	int fd = open_and_grab_device(device_path, device_name);
+	int fd = open_and_grab_device(device_path, "mouse");
 	free(device_path);
 	
 	return fd;
@@ -296,25 +322,28 @@ static void release_and_close_device(int fd, const char* device_name) {
 	}
 }
 
-// Helper function to reopen device with retry logic
-static int reopen_device(int* fd, const char* vendor_id, const char* model_id, const char* device_name) {
-	fprintf(stderr, "%s fd appears invalid, attempting to reopen device\n", device_name);
+// Helper function to reopen the mouse with retry logic.
+// The search runs again from scratch, so a wireless mouse that comes back on a
+// different model ID - switching between dongle and Bluetooth, say - is picked
+// up as long as both IDs are listed in MOUSE_DEVICES.
+static int reopen_mouse(int* fd) {
+	fprintf(stderr, "mouse fd appears invalid, attempting to reopen device\n");
 	
 	// Release and close old fd
-	release_and_close_device(*fd, device_name);
+	release_and_close_device(*fd, "mouse");
 	*fd = -1;
 	
 	// Wait a bit before reopening
 	sleep(1);
 	
 	// Try to find and reopen device
-	*fd = find_open_and_grab_device(vendor_id, model_id, device_name);
+	*fd = find_open_and_grab_mouse();
 	if (*fd < 0) {
-		fprintf(stderr, "Failed to reopen %s device, will retry\n", device_name);
+		fprintf(stderr, "Failed to reopen mouse device, will retry\n");
 		return -1;
 	}
 	
-	fprintf(stderr, "Successfully reopened and grabbed %s device\n", device_name);
+	fprintf(stderr, "Successfully reopened and grabbed mouse device\n");
 	return 0;
 }
 
@@ -383,8 +412,6 @@ static void send_input_event_to_keyboard(struct input_event* ev) {
 
 // Thread that will handle mouse INPUT and OUTPUT events
 typedef struct {
-	const char* vendor_id;
-	const char* model_id;
 	const int out_fd;
 } mouse_thread_args_t;
 // Send a mouse button event to whichever virtual device it belongs on.
@@ -467,7 +494,7 @@ void* mouse_thread_io_func(void* args_void) {
 	mouse_thread_args_t* args = (mouse_thread_args_t*)args_void;
 
 	// Find, open and grab the mouse event device
-	int mouse_fd = find_open_and_grab_device(args->vendor_id, args->model_id, "mouse");
+	int mouse_fd = find_open_and_grab_mouse();
 	if (mouse_fd < 0)
 	{
 		pthread_exit(NULL);
@@ -521,7 +548,7 @@ void* mouse_thread_io_func(void* args_void) {
 			flush_due_releases(args->out_fd, 1);
 
 			// Always try to reopen on any read error
-			if (reopen_device(&mouse_fd, args->vendor_id, args->model_id, "mouse") == 0) {
+			if (reopen_mouse(&mouse_fd) == 0) {
 				consecutive_failures = 0;
 				// Reset accumulators on reconnect
 				accum_x = 0.0;
@@ -704,11 +731,11 @@ int main()
 	fprintf(stderr, "Starting G502 daemon...\n");
 	sleep(1);
 
-	char* g502_event_device_path = find_event_device(G502_USB_VENDOR_ID_S, G502_MODEL_ID_S, "G502");
-	if (!g502_event_device_path) {
+	char* mouse_event_device_path = find_mouse_device();
+	if (!mouse_event_device_path) {
 		return 1;
 	}
-	free(g502_event_device_path);
+	free(mouse_event_device_path);
 
 	// Discover every keyboard on the system. This must happen before the virtual
 	// keyboard is created, otherwise we would find and then grab our own output.
@@ -777,10 +804,10 @@ int main()
 	struct uinput_setup v_g502_setup = {
 		.id = {
 			.bustype = BUS_USB,
-			.vendor  = G502_USB_VENDOR_ID,
-			.product = G502_MODEL_ID,
+			.vendor  = V_MOUSE_VENDOR,
+			.product = V_MOUSE_MODEL,
 		},
-		.name = "Virtual G502 Hero",
+		.name = V_MOUSE_NAME,
 	};
 	if (ioctl(v_g502_fd, UI_DEV_SETUP, &v_g502_setup) < 0 ||
 	    ioctl(v_g502_fd, UI_DEV_CREATE) < 0) {
@@ -873,8 +900,6 @@ int main()
 	// Start mouse IO thread
 	pthread_t mouse_io_thread;
 	mouse_thread_args_t mouse_io_args = {
-		.vendor_id = G502_USB_VENDOR_ID_S,
-		.model_id = G502_MODEL_ID_S,
 		.out_fd = v_g502_fd,
 	};
 	if (pthread_create(&mouse_io_thread, NULL, mouse_thread_io_func, &mouse_io_args) != 0) {

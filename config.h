@@ -1,11 +1,31 @@
 #ifndef CONFIG_H
 #define CONFIG_H
 
-// G502 identifiers
-#define G502_USB_VENDOR_ID   0x046d
-#define G502_USB_VENDOR_ID_S "046d"
-#define G502_MODEL_ID        0xc332
-#define G502_MODEL_ID_S      "c332"
+// Mice the daemon will drive, tried in this order; the first one present wins.
+//
+//     X(vendor id, model id, description)
+//
+// These are the lowercase hex IDs udev reports as ID_USB_VENDOR_ID and
+// ID_MODEL_ID, which are the same pair `lsusb` prints. A wireless mouse reports
+// a *different* model ID per connection mode, so list every mode you actually
+// use or the daemon will silently stop finding it when you switch.
+//
+// Only 1532:00aa (Basilisk, wired) and 046d:c332 have been confirmed here. The
+// other two are the conventional dongle and Bluetooth IDs and are unverified -
+// check with `lsusb` while connected that way, and correct them if they differ.
+#define MOUSE_DEVICES                                          \
+	X("1532", "00aa", "Razer Basilisk V3 Pro (wired)")     \
+	X("1532", "00ab", "Razer Basilisk V3 Pro (dongle)")    \
+	X("1532", "00ac", "Razer Basilisk V3 Pro (Bluetooth)") \
+	X("046d", "c332", "Logitech G502 Proteus Spectrum")
+
+// What the virtual mouse reports about itself. The name is what the compositor
+// shows (hyprctl devices) and what device rules match on, so renaming it means
+// updating any config that refers to it. It is deliberately still the G502 name
+// so existing rules keep working, even though the daemon is no longer G502-only.
+#define V_MOUSE_NAME   "Virtual G502 Hero"
+#define V_MOUSE_VENDOR 0x046d
+#define V_MOUSE_MODEL  0xc332
 // Virtual keyboard identifiers.
 // These are only what the virtual device reports about itself; keyboards are
 // discovered at runtime via udev's ID_INPUT_KEYBOARD tag, so there is nothing to
