@@ -333,9 +333,43 @@ the next poll.
 
 Without that rule everything else still works and the stats are simply omitted.
 
-The waybar side is two edits to `~/.config/waybar/`: a `custom/g502d` module pointing at
-`g502d-status`, and a few rules in `style.css`. Waybar does not auto-reload - run
-`omarchy restart waybar`.
+The waybar side is two edits to `~/.config/waybar/`. In `config.jsonc`, add `"custom/g502d"`
+to `modules-right` and define it:
+
+```jsonc
+"custom/g502d": {
+  "format": "{icon} {text}",
+  "format-icons": {
+    "routed": "\udb80\udf7d",
+    "degraded": "\udb82\udd9e",
+    "low": "\udb80\udf7d",
+    "off": "\udb80\udf7e"
+  },
+  "tooltip": true,
+  "interval": 30,
+  "return-type": "json",
+  "exec": "$HOME/.local/bin/g502d-status",
+  "on-click": "$HOME/.local/bin/g502d-ctl toggle",
+  "on-click-right": "omarchy-launch-floating-terminal-with-presentation $HOME/.local/bin/g502d-ctl show",
+  "signal": 9
+}
+```
+
+Use `{text}`, not `{}`. Mixing a named placeholder with a positional one is rejected by
+current fmt, and waybar responds by dropping the module completely - the bar renders fine
+with the module simply absent, which looks like the config never loaded. `waybar -l trace`
+prints the actual error.
+
+Then in `style.css`, dim the module when input is bypassing the daemon:
+
+```css
+#custom-g502d { min-width: 12px; margin: 0 7.5px; }
+#custom-g502d.off, #custom-g502d.degraded { opacity: 0.5; }
+#custom-g502d.low { color: #a55555; }
+```
+
+Waybar does not auto-reload - run `omarchy restart waybar`, and make sure the config write
+has actually landed first.
 
 ## Hotplug
 
