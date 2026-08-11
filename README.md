@@ -8,7 +8,7 @@ wins. Two are set up:
 
 | Mouse | USB ID | Working side buttons |
 | --- | --- | --- |
-| Razer Basilisk V3 Pro | `1532:00aa` wired | 2 of 3 - see below |
+| Razer Basilisk V3 Pro | `1532:00aa` wired | 3 of 3, after an onboard rebind |
 | G502 Proteus Spectrum | `046d:c332` | 3 of 3, after an onboard rebind |
 
 The G502 work was done against a **Proteus Spectrum** (firmware `U1 03.02`, which reports its
@@ -176,14 +176,79 @@ Convenient side effect: a key from a keyboard interface is a real keypress as fa
 is concerned, so binding the paddle straight to Left Alt works with or without this daemon.
 The daemon grabs those interfaces and forwards them anyway, so it behaves the same either way.
 
-Setting that binding needs Razer's onboard protocol, which is not HID++ and is not covered by
-the tools here. Two routes:
+### Rebinding the paddle
 
-- **Razer Synapse on Windows**, saving to *onboard memory* rather than a cloud profile. The
-  binding then lives in the mouse and persists on Linux.
-- **Reverse-engineer it**, as was done for HID++. Razer uses 90-byte HID feature reports;
-  `openrazer` implements lighting, DPI and polling rate, but not general button remapping for
-  this model, so this is real work rather than a config change.
+`tools/razer.py` does this over Razer's onboard protocol. Nothing off the shelf can: openrazer
+has no button-remapping code at all (issues [#2031][or2031], [#2688][or2688]) and libratbag has
+no Razer driver ([#103][lr103]).
+
+    sudo ./tools/razer.py info                                    # prove the transport works
+    sudo ./tools/razer.py read 15                                 # the paddle's slot
+    sudo ./tools/razer.py backup ~/.local/share/g502d/razer.json
+    sudo ./tools/razer.py set-key 15 lalt                         # dry run, prints the diff
+    sudo ./tools/razer.py set-key 15 lalt --i-understand-this-writes-onboard-memory
+
+The paddle then reports Left Alt on the mouse's keyboard interface, which Wayland accepts as a
+genuine modifier - so it works with or without this daemon. To undo it:
+
+    sudo ./tools/razer.py restore ~/.local/share/g502d/razer.json --i-understand-this-writes-onboard-memory
+
+**Caveat:** as with the G502, this lives in the mouse. It survives reboots, applies to Windows
+too, and Synapse may overwrite it.
+
+### The protocol
+
+Razer's is a 90-byte HID feature report, unrelated to HID++. Framing and CRC are from
+openrazer's [`razercommon.h`][rzh] / [`.c`][rzc]; the button-assignment command class is from
+[OpenSnek][snek], which reverse-engineered it for macOS.
+
+    byte 0      status (response: 0x02 success, 0x01 busy, 0x03 failure, 0x05 unsupported)
+    byte 1      transaction id - 0x1f for the Basilisk V3 Pro
+    bytes 2-3   remaining packets, big-endian
+    byte 4      protocol type
+    byte 5      data size
+    byte 6      command class
+    byte 7      command id
+    bytes 8-87  arguments
+    byte 88     CRC: XOR of bytes 2..87
+    byte 89     reserved
+
+Sent as a feature report, report id 0, on USB interface 0. Button assignment is command class
+`0x02`, id `0x0c` to write and `0x8c` to read, with arguments `[profile, slot, hypershift]`
+followed by a 7-byte function block:
+
+    00 00 ...                    disabled
+    01 01 <button>               HID mouse button
+    02 02 <modifiers> <usage>    HID keyboard key
+    06 01 <action> <dpi be16 x2> device-internal action
+    0d 04 <mods> <usage> <rate>  keyboard key, turbo
+    0e 03 <button> <rate be16>   mouse button, turbo
+
+Modifier bits are Ctrl `0x01`, Shift `0x02`, Alt `0x04`, GUI `0x08`, right-hand variants in the
+high nibble. The key is a standard HID keyboard usage, so Left Alt is `0xe2` and F13-F24 are
+`0x68`-`0x73`.
+
+Slots on this mouse, from `./tools/razer.py dump`. Reading a slot that does not exist returns
+status `0x03`, which is a useful way to map the table:
+
+| Slot | Factory binding | |
+| --- | --- | --- |
+| 1-5 | `01 01 0n` | mouse buttons 1-5 |
+| 9, 10 | `01 01 09` / `01 01 0a` | mouse buttons 9 and 10 |
+| 14 | `07 01 04` | undocumented class `0x07` |
+| 15 | `06 01 05 01 90 01 90` | sensitivity clutch, 400 DPI on both axes |
+| 52, 53, 96 | | present; not investigated |
+
+Slot 15's trailing `01 90 01 90` is two big-endian `0x0190` = 400, the DPI the clutch drops to.
+That is the whole reason the paddle was silent: the firmware acts on it internally and puts
+nothing on the wire.
+
+[or2031]: https://github.com/openrazer/openrazer/issues/2031
+[or2688]: https://github.com/openrazer/openrazer/issues/2688
+[lr103]: https://github.com/libratbag/libratbag/issues/103
+[rzh]: https://github.com/openrazer/openrazer/blob/master/driver/razercommon.h
+[rzc]: https://github.com/openrazer/openrazer/blob/master/driver/razercommon.c
+[snek]: https://github.com/gh123man/OpenSnek
 
 ## Debouncing a worn switch
 
@@ -250,6 +315,7 @@ gated behind an explicit flag.
 | `tools/button_spy.py` | Watch raw button state via feature `0x8110` |
 | `tools/hidraw_watch.py` | Capture raw HID reports from both interfaces |
 | `tools/identify_buttons.py` | Watch every interface of a device and name what each button sends |
+| `tools/razer.py` | Razer onboard protocol: read and rebind button slots |
 | `tools/clickcount.py` | Count press/release pairs on an evdev node, flag duplicates |
 | `tools/clicktest.html` | Same, but at the application layer - open it in a browser |
 
