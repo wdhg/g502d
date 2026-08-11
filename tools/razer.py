@@ -54,6 +54,12 @@ RAZER_VENDOR = "1532"
 DEFAULT_TRANSACTION_ID = 0x1F
 CONTROL_INTERFACE = 0
 
+# Product ids that mean the mouse is plugged in. Connection mode changes the USB
+# product id on this device, so the id itself identifies the transport - more
+# reliable than inferring it from a charging flag, which is also set when a
+# wireless mouse is charging.
+WIRED_PRODUCTS = {0x00AA}
+
 # Button assignment, from OpenSnek Sources/OpenSnek/Bridge/BridgeClient+USB.swift
 CLASS_BUTTON = 0x02
 CMD_SET_BINDING = 0x0C
@@ -117,8 +123,8 @@ class RazerError(Exception):
     pass
 
 
-def find_control_hidraw():
-    """The hidraw node on the interface that accepts control reports."""
+def hidraw_candidates():
+    """[(interface number, node, product id)] for every connected Razer hidraw."""
     candidates = []
     for path in sorted(glob.glob("/sys/class/hidraw/hidraw*")):
         uevent = os.path.join(path, "device", "uevent")
@@ -127,7 +133,17 @@ def find_control_hidraw():
                 text = handle.read()
         except OSError:
             continue
-        if f":0000{RAZER_VENDOR.upper()}:" not in text.upper():
+
+        # HID_ID=0003:00001532:000000AA - bus, vendor, product
+        product = None
+        for line in text.splitlines():
+            if not line.startswith("HID_ID="):
+                continue
+            parts = line.split("=", 1)[1].split(":")
+            if len(parts) == 3 and int(parts[1], 16) == int(RAZER_VENDOR, 16):
+                product = int(parts[2], 16)
+            break
+        if product is None:
             continue
 
         # .../usbN/N-M/N-M:1.X/0003:1532:00AA.0001/hidraw/hidrawN
@@ -137,21 +153,31 @@ def find_control_hidraw():
                 number = int(handle.read().strip(), 16)
         except (OSError, ValueError):
             continue
-        node = "/dev/" + os.path.basename(path)
-        candidates.append((number, node))
+        candidates.append((number, "/dev/" + os.path.basename(path), product))
 
+    return sorted(candidates)
+
+
+def find_control_hidraw():
+    """(node, product id) for the interface that accepts control reports."""
+    candidates = hidraw_candidates()
     if not candidates:
         raise RazerError("no Razer hidraw node found - is the mouse connected?")
-    for number, node in sorted(candidates):
+    for number, node, product in candidates:
         if number == CONTROL_INTERFACE:
-            return node
+            return node, product
     # Fall back to the lowest interface rather than guessing wrong silently
-    return sorted(candidates)[0][1]
+    _, node, product = candidates[0]
+    return node, product
 
 
 class Device:
     def __init__(self, path=None, transaction_id=DEFAULT_TRANSACTION_ID, verbose=False):
-        self.path = path or find_control_hidraw()
+        if path:
+            self.path = path
+            self.product = next((p for _, node, p in hidraw_candidates() if node == path), None)
+        else:
+            self.path, self.product = find_control_hidraw()
         self.transaction_id = transaction_id
         self.verbose = verbose
         try:
@@ -243,6 +269,10 @@ class Device:
         response = self.request(0x00, 0x82, bytes(22))
         raw = response[ARGUMENTS:ARGUMENTS + 22]
         return raw.split(b"\x00")[0].decode("ascii", "replace")
+
+    def is_wired(self):
+        """True when the mouse is plugged in, so battery is not worth reporting."""
+        return self.product in WIRED_PRODUCTS
 
     def battery_percent(self):
         """Charge as a percentage, or None if the device does not report one."""
@@ -336,7 +366,7 @@ def cmd_info(dev, _args):
 
 def cmd_status(dev, args):
     """Everything the mouse will tell us about itself."""
-    stats = {}
+    stats = {"wired": dev.is_wired()}
     for name, getter in (("firmware", lambda: "v%d.%d" % dev.firmware_version()),
                          ("serial", dev.serial),
                          ("battery_percent", dev.battery_percent),
@@ -357,8 +387,10 @@ def cmd_status(dev, args):
     print(f"device:   {dev.path}")
     print(f"firmware: {stats['firmware'] or 'unknown'}")
     print(f"serial:   {stats['serial'] or 'unknown'}")
-    if stats["battery_percent"] is None:
-        print("battery:  not reported (wired-only or unsupported)")
+    if dev.is_wired():
+        print("power:    wired")
+    elif stats["battery_percent"] is None:
+        print("battery:  not reported")
     else:
         print(f"battery:  {stats['battery_percent']}%"
               f"{' (charging)' if stats['charging'] else ''}")

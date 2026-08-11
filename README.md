@@ -317,7 +317,12 @@ it runs as your user) and lists exactly which devices are captured.
 | `routed` | Holding grabs, virtual devices present - working |
 | `degraded` | Running, but capturing nothing; input reaches the compositor directly |
 | `off` | Service stopped |
-| `low` | Routed, battery at or below 15% |
+| `low` | Routed, on battery at or below 15% |
+
+The bar shows the charge only when the mouse is on battery. Wired, it reads a permanent
+100% charging, so the module shows DPI instead and the tooltip just says `power: wired`.
+Transport is identified by USB product id - this mouse enumerates differently per connection
+mode - rather than by the charging flag, which is also set while a wireless mouse charges.
 
 Left click toggles the daemon, right click opens the full status in a terminal. Both go
 through `tools/g502d-ctl.sh`, which also signals waybar to refresh rather than waiting for

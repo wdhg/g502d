@@ -100,7 +100,7 @@ def device_stats():
         return {}
     try:
         with razer.Device() as dev:
-            stats = {}
+            stats = {"wired": dev.is_wired()}
             for name, getter in (("battery", dev.battery_percent),
                                  ("charging", dev.is_charging),
                                  ("dpi", dev.dpi),
@@ -151,7 +151,11 @@ def build():
 
     if stats:
         lines.append("")
-        if stats.get("battery") is not None:
+        if stats.get("wired"):
+            # Plugged in, so the battery reads a permanent 100% charging. Saying
+            # "wired" is the useful information; the number is not.
+            lines.append("power: wired")
+        elif stats.get("battery") is not None:
             charging = " charging" if stats.get("charging") else ""
             lines.append(f"battery: {stats['battery']}%{charging}")
         if stats.get("dpi"):
@@ -160,16 +164,17 @@ def build():
         if stats.get("polling"):
             lines.append(f"polling: {stats['polling']} Hz")
 
-    # The bar itself shows battery when there is one, DPI otherwise - a wired
-    # mouse reports no charge, and a blank module looks broken.
-    if stats.get("battery") is not None:
+    # Show the charge only when it means something. Wired, it is pinned at 100%
+    # and just takes up room, so fall back to DPI.
+    on_battery = not stats.get("wired") and stats.get("battery") is not None
+    if on_battery:
         text = f"{stats['battery']}%"
     elif stats.get("dpi"):
         text = f"{stats['dpi'][0]}"
     else:
         text = ""
 
-    if status == "routed" and stats.get("battery") is not None and stats["battery"] <= 15:
+    if status == "routed" and on_battery and stats["battery"] <= 15:
         status = "low"
 
     return {
