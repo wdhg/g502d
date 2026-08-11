@@ -10,12 +10,12 @@
 // a *different* model ID per connection mode, so list every mode you actually
 // use or the daemon will silently stop finding it when you switch.
 //
-// Only 1532:00aa (Basilisk, wired) and 046d:c332 have been confirmed here. The
-// other two are the conventional dongle and Bluetooth IDs and are unverified -
-// check with `lsusb` while connected that way, and correct them if they differ.
+// Confirmed on this machine: 1532:00aa wired, 1532:00ab over the HyperSpeed
+// 2.4GHz dongle, 046d:c332. The Bluetooth id is still a guess - check `lsusb`
+// while connected that way and correct it if it differs.
 #define MOUSE_DEVICES                                          \
 	X("1532", "00aa", "Razer Basilisk V3 Pro (wired)")     \
-	X("1532", "00ab", "Razer Basilisk V3 Pro (dongle)")    \
+	X("1532", "00ab", "Razer Basilisk V3 Pro (2.4GHz dongle)") \
 	X("1532", "00ac", "Razer Basilisk V3 Pro (Bluetooth)") \
 	X("046d", "c332", "Logitech G502 Proteus Spectrum")
 

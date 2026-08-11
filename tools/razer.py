@@ -387,7 +387,10 @@ def cmd_status(dev, args):
     print(f"device:   {dev.path}")
     print(f"firmware: {stats['firmware'] or 'unknown'}")
     print(f"serial:   {stats['serial'] or 'unknown'}")
-    if dev.is_wired():
+    if dev.is_wired() and stats["battery_percent"] is not None:
+        state = "fully charged" if stats["battery_percent"] >= 100 else "charging"
+        print(f"power:    wired, {stats['battery_percent']}% ({state})")
+    elif dev.is_wired():
         print("power:    wired")
     elif stats["battery_percent"] is None:
         print("battery:  not reported")

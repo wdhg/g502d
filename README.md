@@ -390,10 +390,36 @@ device node by syspath when a read fails.
 A missing mouse is no longer fatal at startup: the mouse thread waits for one of the
 configured devices to appear.
 
+Two failure modes that only show up when switching a mouse between connection modes:
+
+**Preferred-mouse recovery.** When the mouse in use disappears, the search falls through to
+the next entry in `MOUSE_DEVICES` - reasonable - but it would then keep that lesser mouse
+forever, because a working device never errors and so never triggers another search. Plugging
+the Basilisk's dongle in left the daemon driving the G502. The udev monitor now compares the
+new device's rank against the one in use and pokes a pipe the mouse thread polls alongside
+the device, so it re-picks immediately.
+
+**Keyboards that never come back.** A replugged device reappears under a *new* syspath, so
+`refresh_keyboard_devnode()` could never find the old one again. The thread retried forever,
+one failed `read()` on a closed fd every six seconds - 20 log lines a minute per dead
+keyboard. Threads now give up after `KEYBOARD_REOPEN_ATTEMPTS` and release their slot for
+reuse; the monitor adds the replacement as a new entry.
+
 ## Wireless
 
 The Basilisk V3 Pro reports a **different USB product ID per connection mode**, so each mode
-you use has to be listed in `MOUSE_DEVICES`. Only wired `1532:00aa` is confirmed here.
+you use has to be listed in `MOUSE_DEVICES`. Confirmed: `1532:00aa` wired and `1532:00ab`
+over the HyperSpeed 2.4GHz dongle. The Bluetooth id is still a guess.
+
+Note the dongle is a USB device in its own right - `ID_BUS=usb`, bus `0003`. Only a real
+Bluetooth connection appears on bus `0005`, so "wireless" and "Bluetooth" are not the same
+thing here, and `tools/razer.py` works fine over the dongle. Its first command after the
+mouse has been idle may fail while the mouse wakes up; run it again.
+
+The dongle presents **two** `ID_INPUT_MOUSE` nodes with different capabilities - one with 5
+buttons and wheel tilt, one with 6 buttons and no tilt. Only one carries movement. Ties in
+`find_mouse_device()` keep the first node enumerated; confirm with
+`./tools/identify_buttons.py razer` if the pointer ever goes dead after a mode switch.
 
 Device matching is deliberately not based on udev's `ID_USB_VENDOR_ID` / `ID_MODEL_ID`
 properties, because those exist only for USB devices - over Bluetooth the same mouse arrives

@@ -167,7 +167,27 @@ static const struct {
 // presents under one ID - the Basilisk V3 Pro has four, two of them keyboards.
 //
 // Returns a malloc'd path, or NULL when no configured mouse is present.
-static char* find_mouse_device(void) {
+// Position of a device in MOUSE_DEVICES, or KNOWN_MOUSE_COUNT if not listed.
+// Lower is better: the order in config.h is a preference order.
+static size_t rank_for_device(sd_device* device) {
+	sd_device *parent = NULL;
+	const char* vendor = NULL;
+	const char* product = NULL;
+	if (sd_device_get_parent(device, &parent) < 0 ||
+	    sd_device_get_sysattr_value(parent, "id/vendor", &vendor) < 0 ||
+	    sd_device_get_sysattr_value(parent, "id/product", &product) < 0) {
+		return KNOWN_MOUSE_COUNT;
+	}
+	for (size_t i = 0; i < KNOWN_MOUSE_COUNT; i++) {
+		if (strcasecmp(vendor, known_mice[i].vendor) == 0 &&
+		    strcasecmp(product, known_mice[i].model) == 0) {
+			return i;
+		}
+	}
+	return KNOWN_MOUSE_COUNT;
+}
+
+static char* find_mouse_device(size_t* out_rank) {
 	struct sd_device_enumerator *enumerator = NULL;
 	if (sd_device_enumerator_new(&enumerator) < 0) {
 		fprintf(stderr, "Failed to create device enumerator\n");
@@ -194,32 +214,20 @@ static char* find_mouse_device(void) {
 			continue;
 		}
 
-		sd_device *parent = NULL;
-		const char* vendor = NULL;
-		const char* product = NULL;
-		if (sd_device_get_parent(device, &parent) < 0 ||
-		    sd_device_get_sysattr_value(parent, "id/vendor", &vendor) < 0 ||
-		    sd_device_get_sysattr_value(parent, "id/product", &product) < 0) {
+		// The order in MOUSE_DEVICES decides which mouse wins when several are
+		// connected. Ties keep the first node enumerated.
+		size_t rank = rank_for_device(device);
+		if (rank >= best_rank) {
 			continue;
 		}
-
-		// Only look at entries that could outrank what we already have, so the
-		// order in MOUSE_DEVICES decides which mouse wins when several are on.
-		for (size_t i = 0; i < best_rank; i++) {
-			if (strcasecmp(vendor, known_mice[i].vendor) != 0 ||
-			    strcasecmp(product, known_mice[i].model) != 0) {
-				continue;
-			}
-			const char* devnode = NULL;
-			if (sd_device_get_devname(device, &devnode) < 0) {
-				break;
-			}
-			free(best);
-			best = strdup(devnode);
-			best_rank = i;
-			best_label = known_mice[i].label;
-			break;
+		const char* devnode = NULL;
+		if (sd_device_get_devname(device, &devnode) < 0) {
+			continue;
 		}
+		free(best);
+		best = strdup(devnode);
+		best_rank = rank;
+		best_label = known_mice[rank].label;
 	}
 
 	sd_device_enumerator_unref(enumerator);
@@ -227,6 +235,9 @@ static char* find_mouse_device(void) {
 	if (best) {
 		fprintf(stderr, "Mouse found: %s (%s:%s) at %s\n", best_label,
 			known_mice[best_rank].vendor, known_mice[best_rank].model, best);
+		if (out_rank) {
+			*out_rank = best_rank;
+		}
 		return best;
 	}
 
@@ -248,6 +259,7 @@ typedef struct {
 	char syspath[256];
 	char devnode[64];
 	char name[128];
+	int active; // 0 once its thread has given up, freeing the slot for reuse
 } keyboard_device_t;
 
 // Populate a keyboard record from a udev device.
@@ -357,15 +369,28 @@ static int open_and_grab_device(const char* device_path, const char* device_name
 	return fd;
 }
 
+// Rank of the mouse currently held, so the udev monitor can tell whether
+// something better has just been connected. KNOWN_MOUSE_COUNT means none.
+static _Atomic size_t current_mouse_rank = KNOWN_MOUSE_COUNT;
+
+// Wakes the mouse thread out of poll() when it should re-pick its device.
+// Without it, a blocked reader would keep an inferior mouse until that mouse
+// produced an error - which for a working mouse is never.
+static int mouse_wakeup_pipe[2] = {-1, -1};
+
 // Helper function to find, open and grab the mouse
 static int find_open_and_grab_mouse(void) {
-	char* device_path = find_mouse_device();
+	size_t rank = KNOWN_MOUSE_COUNT;
+	char* device_path = find_mouse_device(&rank);
 	if (!device_path) {
 		return -1;
 	}
 	
 	int fd = open_and_grab_device(device_path, "mouse");
 	free(device_path);
+	if (fd >= 0) {
+		current_mouse_rank = rank;
+	}
 	
 	return fd;
 }
@@ -587,9 +612,28 @@ void* mouse_thread_io_func(void* args_void) {
 			timeout_ms = remaining_us > 0 ? (int)((remaining_us + 999) / 1000) : 0;
 		}
 
-		struct pollfd pfd = { .fd = mouse_fd, .events = POLLIN, .revents = 0 };
-		int ready = poll(&pfd, 1, timeout_ms);
+		struct pollfd pfds[2] = {
+			{ .fd = mouse_fd,             .events = POLLIN, .revents = 0 },
+			{ .fd = mouse_wakeup_pipe[0], .events = POLLIN, .revents = 0 },
+		};
+		int nfds = mouse_wakeup_pipe[0] >= 0 ? 2 : 1;
+		int ready = poll(pfds, nfds, timeout_ms);
 		if (ready < 0 && errno == EINTR) {
+			continue;
+		}
+
+		// A better mouse was connected; drop this one and re-pick.
+		if (nfds == 2 && (pfds[1].revents & POLLIN)) {
+			char drain[64];
+			while (read(mouse_wakeup_pipe[0], drain, sizeof(drain)) > 0) {
+				// Coalesce: several devices can appear at once
+			}
+			fprintf(stderr, "A preferred mouse was connected, switching\n");
+			flush_due_releases(args->out_fd, 1);
+			release_and_close_device(mouse_fd, "mouse");
+			mouse_fd = wait_for_mouse();
+			accum_x = 0.0;
+			accum_y = 0.0;
 			continue;
 		}
 
@@ -710,12 +754,26 @@ void* mouse_thread_io_func(void* args_void) {
 
 // Thread that will handle INPUT keyboard events.
 // One of these runs per physical keyboard; they all feed the same event buffer.
+// How long a vanished keyboard is waited for before its thread gives up, in
+// one-second attempts. A device that is unplugged and replugged comes back under
+// a *new* syspath, so refresh_keyboard_devnode() can never find it again and the
+// udev monitor adds the replacement separately. Retrying forever just spins.
+#define KEYBOARD_REOPEN_ATTEMPTS 30
+
+// Mark a keyboard's slot free so a later device can reuse it.
+static void release_keyboard_slot(keyboard_device_t* kb) {
+	pthread_mutex_lock(&keyboards_mutex);
+	kb->active = 0;
+	pthread_mutex_unlock(&keyboards_mutex);
+}
+
 void* keyboard_process_i(void* args_void) {
 	keyboard_device_t* kb = (keyboard_device_t*)args_void;
 
 	// Open and grab the keyboard event device
 	int kb_fd = open_and_grab_device(kb->devnode, kb->name);
 	if (kb_fd < 0) {
+		release_keyboard_slot(kb);
 		pthread_exit(NULL);
 	}
 	fprintf(stderr, "Grabbed keyboard: %s (%s)\n", kb->name, kb->devnode);
@@ -724,34 +782,37 @@ void* keyboard_process_i(void* args_void) {
 	while (1) {
 		struct input_event ev;
 		ssize_t n = read(kb_fd, &ev, sizeof(ev));
-		if (n != sizeof(ev)) {
-			int err = errno;
-			fprintf(stderr, "Failed to read from keyboard %s: read returned %zd bytes, errno=%d (%s)\n",
-				kb->name, n, err, get_errno_name(err));
-			fprintf(stderr, "  Keyboard fd=%d, is_valid=%d\n", kb_fd, is_fd_valid(kb_fd));
-
-			// Clear the buffer before reopening to avoid stale events
-			clear_keyboard_buffer();
-
-			// Always try to reopen on any read error
-			release_and_close_device(kb_fd, kb->name);
-			kb_fd = -1;
-			sleep(1);
-			if (refresh_keyboard_devnode(kb) == 0 &&
-			    (kb_fd = open_and_grab_device(kb->devnode, kb->name)) >= 0) {
-				fprintf(stderr, "Reopened keyboard: %s (%s)\n", kb->name, kb->devnode);
-			} else {
-				sleep(5); // Wait before retrying
-			}
+		if (n == sizeof(ev)) {
+			send_input_event_to_keyboard(&ev);
 			continue;
 		}
 
-		// Process the keyboard event here
-		send_input_event_to_keyboard(&ev);
-	}
+		int err = errno;
+		fprintf(stderr, "Failed to read from keyboard %s: read returned %zd bytes, errno=%d (%s)\n",
+			kb->name, n, err, get_errno_name(err));
 
-	// Release and close the keyboard device
-	release_and_close_device(kb_fd, kb->name);
+		// Clear the buffer before reopening to avoid stale events
+		clear_keyboard_buffer();
+		release_and_close_device(kb_fd, kb->name);
+		kb_fd = -1;
+
+		for (int attempt = 1; kb_fd < 0; attempt++) {
+			sleep(1);
+			if (refresh_keyboard_devnode(kb) == 0) {
+				kb_fd = open_and_grab_device(kb->devnode, kb->name);
+			}
+			if (kb_fd >= 0) {
+				fprintf(stderr, "Reopened keyboard: %s (%s)\n", kb->name, kb->devnode);
+				break;
+			}
+			if (attempt >= KEYBOARD_REOPEN_ATTEMPTS) {
+				fprintf(stderr, "Keyboard %s did not come back after %d attempts; releasing it\n",
+					kb->name, attempt);
+				release_keyboard_slot(kb);
+				pthread_exit(NULL);
+			}
+		}
+	}
 
 	pthread_exit(NULL);
 }
@@ -799,27 +860,37 @@ void* keyboard_process_o(void* args_void) {
 static void add_keyboard(const keyboard_device_t* found) {
 	pthread_mutex_lock(&keyboards_mutex);
 
+	int slot = -1;
 	for (int i = 0; i < keyboard_count; i++) {
-		if (strcmp(keyboards[i].syspath, found->syspath) == 0) {
+		if (keyboards[i].active && strcmp(keyboards[i].syspath, found->syspath) == 0) {
 			pthread_mutex_unlock(&keyboards_mutex);
 			return; // Already ours
 		}
+		if (!keyboards[i].active && slot < 0) {
+			slot = i; // A thread that gave up left this free
+		}
 	}
-	if (keyboard_count >= MAX_KEYBOARDS) {
-		fprintf(stderr, "Ignoring keyboard %s: already tracking %d\n",
-			found->name, MAX_KEYBOARDS);
-		pthread_mutex_unlock(&keyboards_mutex);
-		return;
+	if (slot < 0) {
+		if (keyboard_count >= MAX_KEYBOARDS) {
+			fprintf(stderr, "Ignoring keyboard %s: already tracking %d\n",
+				found->name, MAX_KEYBOARDS);
+			pthread_mutex_unlock(&keyboards_mutex);
+			return;
+		}
+		slot = keyboard_count++;
 	}
 
-	keyboards[keyboard_count] = *found;
-	if (pthread_create(&keyboard_threads[keyboard_count], NULL,
-	                   keyboard_process_i, &keyboards[keyboard_count]) != 0) {
+	keyboards[slot] = *found;
+	keyboards[slot].active = 1;
+	if (pthread_create(&keyboard_threads[slot], NULL,
+	                   keyboard_process_i, &keyboards[slot]) != 0) {
 		fprintf(stderr, "Failed to create input thread for keyboard %s\n", found->name);
+		keyboards[slot].active = 0;
 		pthread_mutex_unlock(&keyboards_mutex);
 		return;
 	}
-	keyboard_count++;
+	// Detached: these threads are never joined, and slots get reused.
+	pthread_detach(keyboard_threads[slot]);
 
 	pthread_mutex_unlock(&keyboards_mutex);
 }
@@ -837,6 +908,18 @@ static int on_input_device_event(sd_device_monitor* monitor, sd_device* device, 
 	const char* sysname = NULL;
 	if (sd_device_get_sysname(device, &sysname) < 0 || strncmp(sysname, "event", 5) != 0) {
 		return 0;
+	}
+
+	// A higher-priority mouse than the one we hold: ask the mouse thread to
+	// re-pick. Falling back to a lesser mouse is expected when the preferred one
+	// is unplugged; staying on it afterwards is not.
+	const char* mouse = NULL;
+	if (sd_device_get_property_value(device, "ID_INPUT_MOUSE", &mouse) >= 0 &&
+	    strcmp(mouse, "1") == 0) {
+		if (rank_for_device(device) < current_mouse_rank && mouse_wakeup_pipe[1] >= 0) {
+			ssize_t ignored = write(mouse_wakeup_pipe[1], "1", 1);
+			(void)ignored;
+		}
 	}
 
 	const char* keyboard = NULL;
@@ -908,7 +991,14 @@ int main()
 	sleep(1);
 
 	// Not fatal if absent: the mouse thread waits for one to be connected.
-	free(find_mouse_device());
+	free(find_mouse_device(NULL));
+
+	// Non-blocking so the mouse thread can drain it without stalling.
+	if (pipe2(mouse_wakeup_pipe, O_NONBLOCK | O_CLOEXEC) < 0) {
+		fprintf(stderr, "Failed to create mouse wakeup pipe; the daemon will not "
+		                "switch to a preferred mouse until the current one errors\n");
+		mouse_wakeup_pipe[0] = mouse_wakeup_pipe[1] = -1;
+	}
 
 	// Discover every keyboard on the system. This must happen before the virtual
 	// keyboard is created, otherwise we would find and then grab our own output.

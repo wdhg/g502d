@@ -151,9 +151,12 @@ def build():
 
     if stats:
         lines.append("")
-        if stats.get("wired"):
-            # Plugged in, so the battery reads a permanent 100% charging. Saying
-            # "wired" is the useful information; the number is not.
+        if stats.get("wired") and stats.get("battery") is not None:
+            # Worth keeping the number while wired: it is how you tell a topped-up
+            # mouse from one still charging.
+            state = "fully charged" if stats["battery"] >= 100 else "charging"
+            lines.append(f"power: wired, {stats['battery']}% ({state})")
+        elif stats.get("wired"):
             lines.append("power: wired")
         elif stats.get("battery") is not None:
             charging = " charging" if stats.get("charging") else ""
@@ -164,10 +167,10 @@ def build():
         if stats.get("polling"):
             lines.append(f"polling: {stats['polling']} Hz")
 
-    # Show the charge only when it means something. Wired, it is pinned at 100%
-    # and just takes up room, so fall back to DPI.
+    # Show the charge whenever there is one, wired included - seeing it reach
+    # 100% is the point. DPI is the fallback when there is no battery at all.
     on_battery = not stats.get("wired") and stats.get("battery") is not None
-    if on_battery:
+    if stats.get("battery") is not None:
         text = f"{stats['battery']}%"
     elif stats.get("dpi"):
         text = f"{stats['dpi'][0]}"
