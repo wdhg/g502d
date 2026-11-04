@@ -1,8 +1,8 @@
 [Unit]
-Description=G502 Daemon
+Description=Mouse Daemon
 
 [Service]
-ExecStart=%h/.local/bin/g502d
+ExecStart=%h/.local/bin/moused
 StandardOutput=journal
 StandardError=journal
 

@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# Control surface for the g502d waybar module.
+# Control surface for the moused waybar module.
 #
-#   g502d-ctl toggle   start or stop the daemon, then refresh the bar
-#   g502d-ctl show     print full status and wait for a keypress
-#   g502d-ctl refresh  just refresh the bar
+#   moused-ctl toggle   start or stop the daemon, then refresh the bar
+#   moused-ctl show     print full status and wait for a keypress
+#   moused-ctl refresh  just refresh the bar
 #
 # The waybar module is wired to `toggle` on left click and `show` on right.
 
 set -uo pipefail
 
-SERVICE=g502d
+SERVICE=moused
 SIGNAL=9 # must match "signal" in the waybar module
-STATUS="$(dirname "$(readlink -f "$0")")/g502d-status"
-[ -x "$STATUS" ] || STATUS="$HOME/.local/bin/g502d-status"
+STATUS="$(dirname "$(readlink -f "$0")")/moused-status"
+[ -x "$STATUS" ] || STATUS="$HOME/.local/bin/moused-status"
 
 refresh() {
 	# Waybar reruns a custom module's exec when it receives RTMIN+<signal>.
@@ -24,10 +24,10 @@ case "${1:-show}" in
 toggle)
 	if systemctl --user is-active --quiet "$SERVICE"; then
 		systemctl --user stop "$SERVICE"
-		notify-send -a g502d "g502d stopped" "Input goes straight to the compositor." 2>/dev/null || true
+		notify-send -a moused "moused stopped" "Input goes straight to the compositor." 2>/dev/null || true
 	else
 		systemctl --user start "$SERVICE"
-		notify-send -a g502d "g502d started" "Input is routed through the virtual devices." 2>/dev/null || true
+		notify-send -a moused "moused started" "Input is routed through the virtual devices." 2>/dev/null || true
 	fi
 	# Give the daemon a moment to create or tear down its virtual devices,
 	# otherwise the refresh reads the state we just left.

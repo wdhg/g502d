@@ -6,7 +6,7 @@ Interface 1 (hidraw1) carries HID++ (report IDs 0x10 short / 0x11 long) plus the
 keyboard/consumer/system collections the mouse also exposes.
 
 Anything the mouse physically sends shows up here, regardless of EVIOCGRAB, so this
-works while g502d is running.
+works while moused is running.
 """
 
 import os

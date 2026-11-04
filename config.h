@@ -62,14 +62,14 @@
 // Contact bounce window, in milliseconds. Button releases are held back this
 // long; if the button goes down again before the window expires, the release
 // and the new press are both discarded, because the button never really came
-// up. Set to 0 to disable. See the comment above pending_releases in g502d.c.
+// up. Set to 0 to disable. See the comment above pending_releases in moused.c.
 //
 // The cost is up to this much latency on every button release, so keep it as
 // small as the hardware allows. Measured bounce on this mouse sat at 22-30 ms
 // from the edge; genuine repeat clicks were hundreds of milliseconds apart, so
 // there is a lot of room between the two. Raise it if doubles or dropped drags
 // still get through, lower it if releases feel sluggish. Every suppressed
-// bounce is logged (journalctl --user -u g502d), so the log tells you the real
+// bounce is logged (journalctl --user -u moused), so the log tells you the real
 // bounce rate rather than leaving you to guess.
 #define CLICK_DEBOUNCE_MS 40
 

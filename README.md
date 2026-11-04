@@ -25,8 +25,8 @@ To install the G502 Daemon, follow these steps:
 
 ```bash
 # Clone the repository
-git clone https://github.com/wdhg/g502d.git
-cd g502d
+git clone https://github.com/wdhg/moused.git
+cd moused
 
 # Build the daemon
 # Note, this will use the configuation defined in config.h
@@ -36,12 +36,12 @@ cd g502d
 ./build.sh
 
 # I recommend testing the daemon before installing it as a service
-./g502d
+./moused
 
 # Install the daemon
 ./install.sh
 
-# This should install and start the g502d service
+# This should install and start the moused service
 
 # Uninstall the daemon
 ./uninstall.sh
@@ -134,7 +134,7 @@ To go back to the factory layout, including on-device DPI control:
 
 Take a backup before any of this, and keep it somewhere outside the repo:
 
-    ./tools/profile_backup.py save ~/.local/share/g502d/onboard-$(date +%F).bin
+    ./tools/profile_backup.py save ~/.local/share/moused/onboard-$(date +%F).bin
 
 If the mouse ends up in a bad state, unplugging it clears anything volatile (button spy,
 host mode). Feature `0x1802 DEVICE_RESET` is the last resort.
@@ -184,14 +184,14 @@ no Razer driver ([#103][lr103]).
 
     sudo ./tools/razer.py info                                    # prove the transport works
     sudo ./tools/razer.py read 15                                 # the paddle's slot
-    sudo ./tools/razer.py backup ~/.local/share/g502d/razer.json
+    sudo ./tools/razer.py backup ~/.local/share/moused/razer.json
     sudo ./tools/razer.py set-key 15 lalt                         # dry run, prints the diff
     sudo ./tools/razer.py set-key 15 lalt --i-understand-this-writes-onboard-memory
 
 The paddle then reports Left Alt on the mouse's keyboard interface, which Wayland accepts as a
 genuine modifier - so it works with or without this daemon. To undo it:
 
-    sudo ./tools/razer.py restore ~/.local/share/g502d/razer.json --i-understand-this-writes-onboard-memory
+    sudo ./tools/razer.py restore ~/.local/share/moused/razer.json --i-understand-this-writes-onboard-memory
 
 **Caveat:** as with the G502, this lives in the mouse. It survives reboots, applies to Windows
 too, and Synapse may overwrite it.
@@ -294,7 +294,7 @@ delayed.
 Every drop is logged, so the journal tells you the real bounce rate and whether
 the window needs adjusting:
 
-    journalctl --user -u g502d -f | grep Debounce
+    journalctl --user -u moused -f | grep Debounce
 
 If real clicks start going missing, lower it. If doubles still get through,
 raise it. Setting it to 0 disables debouncing entirely.
@@ -325,7 +325,7 @@ Transport is identified by USB product id - this mouse enumerates differently pe
 mode - rather than by the charging flag, which is also set while a wireless mouse charges.
 
 Left click toggles the daemon, right click opens the full status in a terminal. Both go
-through `tools/g502d-ctl.sh`, which also signals waybar to refresh rather than waiting for
+through `tools/moused-ctl.sh`, which also signals waybar to refresh rather than waiting for
 the next poll.
 
     ./tools/waybar-status.py --plain      # what the tooltip shows
@@ -338,11 +338,11 @@ the next poll.
 
 Without that rule everything else still works and the stats are simply omitted.
 
-The waybar side is two edits to `~/.config/waybar/`. In `config.jsonc`, add `"custom/g502d"`
+The waybar side is two edits to `~/.config/waybar/`. In `config.jsonc`, add `"custom/moused"`
 to `modules-right` and define it:
 
 ```jsonc
-"custom/g502d": {
+"custom/moused": {
   "format": "{icon} {text}",
   "format-icons": {
     "routed": "\udb80\udf7d",
@@ -353,9 +353,9 @@ to `modules-right` and define it:
   "tooltip": true,
   "interval": 30,
   "return-type": "json",
-  "exec": "$HOME/.local/bin/g502d-status",
-  "on-click": "$HOME/.local/bin/g502d-ctl toggle",
-  "on-click-right": "omarchy-launch-floating-terminal-with-presentation $HOME/.local/bin/g502d-ctl show",
+  "exec": "$HOME/.local/bin/moused-status",
+  "on-click": "$HOME/.local/bin/moused-ctl toggle",
+  "on-click-right": "omarchy-launch-floating-terminal-with-presentation $HOME/.local/bin/moused-ctl show",
   "signal": 9
 }
 ```
@@ -368,9 +368,9 @@ prints the actual error.
 Then in `style.css`, dim the module when input is bypassing the daemon:
 
 ```css
-#custom-g502d { min-width: 12px; margin: 0 7.5px; }
-#custom-g502d.off, #custom-g502d.degraded { opacity: 0.5; }
-#custom-g502d.low { color: #a55555; }
+#custom-moused { min-width: 12px; margin: 0 7.5px; }
+#custom-moused.off, #custom-moused.degraded { opacity: 0.5; }
+#custom-moused.low { color: #a55555; }
 ```
 
 Waybar does not auto-reload - run `omarchy restart waybar`, and make sure the config write
@@ -456,7 +456,7 @@ gated behind an explicit flag.
 | `tools/identify_buttons.py` | Watch every interface of a device and name what each button sends |
 | `tools/razer.py` | Razer onboard protocol: status, read and rebind button slots |
 | `tools/waybar-status.py` | Waybar module: device stats and whether input is routed |
-| `tools/g502d-ctl.sh` | Toggle the daemon and refresh the bar |
+| `tools/moused-ctl.sh` | Toggle the daemon and refresh the bar |
 | `tools/clickcount.py` | Count press/release pairs on an evdev node, flag duplicates |
 | `tools/clicktest.html` | Same, but at the application layer - open it in a browser |
 

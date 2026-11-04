@@ -3,8 +3,8 @@
 # Install as a systemd service
 INSTALL_DIR="$HOME/.local/bin"
 SERVICE_DIR="$HOME/.config/systemd/user"
-SERVICE_NAME="g502d.service"
-PROG_NAME="g502d"
+SERVICE_NAME="moused.service"
+PROG_NAME="moused"
 
 echo "*************"
 echo "* IMPORTANT *"
@@ -36,12 +36,12 @@ systemctl --user start "$SERVICE_NAME"
 echo "$SERVICE_NAME is now enabled and started."
 
 # Install the helper scripts the waybar module uses. razer.py goes alongside
-# g502d-status because the status module imports it for battery and DPI.
+# moused-status because the status module imports it for battery and DPI.
 echo "Installing helper scripts to $INSTALL_DIR..."
 cp tools/razer.py "$INSTALL_DIR/razer.py"
-cp tools/waybar-status.py "$INSTALL_DIR/g502d-status"
-cp tools/g502d-ctl.sh "$INSTALL_DIR/g502d-ctl"
-chmod +x "$INSTALL_DIR/razer.py" "$INSTALL_DIR/g502d-status" "$INSTALL_DIR/g502d-ctl"
+cp tools/waybar-status.py "$INSTALL_DIR/moused-status"
+cp tools/moused-ctl.sh "$INSTALL_DIR/moused-ctl"
+chmod +x "$INSTALL_DIR/razer.py" "$INSTALL_DIR/moused-status" "$INSTALL_DIR/moused-ctl"
 
 # Device stats need hidraw access, which is root-only by default.
 if [ ! -f /etc/udev/rules.d/99-razer-hidraw.rules ] && [ -f udev/99-razer-hidraw.rules ]; then

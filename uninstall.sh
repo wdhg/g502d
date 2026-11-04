@@ -2,8 +2,8 @@
 
 INSTALL_DIR="$HOME/.local/bin"
 SERVICE_DIR="$HOME/.config/systemd/user"
-SERVICE_NAME="g502d.service"
-PROG_NAME="g502d"
+SERVICE_NAME="moused.service"
+PROG_NAME="moused"
 
 # Stop and disable the systemd service
 echo "Stopping and disabling $SERVICE_NAME..."

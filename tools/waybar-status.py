@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Waybar module for g502d: device stats and where input is actually flowing.
+"""Waybar module for moused: device stats and where input is actually flowing.
 
 Prints one line of waybar JSON. The interesting part is `routing`: the daemon
 only does anything if it holds an EVIOCGRAB on the physical devices, so this
@@ -27,7 +27,7 @@ try:
 except ImportError:
     razer = None
 
-SERVICE = "g502d"
+SERVICE = "moused"
 
 # Names the daemon gives its uinput devices, from config.h
 VIRTUAL_MOUSE = "Virtual G502 Hero"
@@ -136,12 +136,12 @@ def build():
 
     lines = []
     if status == "off":
-        lines.append(f"g502d: {state} - input goes straight to the compositor")
+        lines.append(f"moused: {state} - input goes straight to the compositor")
     elif status == "degraded":
-        lines.append("g502d: running but capturing nothing")
+        lines.append("moused: running but capturing nothing")
         lines.append("input is reaching the compositor directly")
     else:
-        lines.append(f"g502d: routing through virtual devices (pid {pid})")
+        lines.append(f"moused: routing through virtual devices (pid {pid})")
 
     if captured:
         lines.append("")

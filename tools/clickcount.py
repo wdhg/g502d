@@ -55,7 +55,7 @@ def autodetect():
         if "virtual" in name.lower() and "g502" in name.lower():
             return name, path
     sys.exit(
-        "could not find the virtual G502 device - is g502d running?\n"
+        "could not find the virtual G502 device - is moused running?\n"
         "Pass a device explicitly, or run with --list to see the options."
     )
 
