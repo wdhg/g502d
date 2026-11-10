@@ -52,6 +52,24 @@ if [ ! -f /etc/udev/rules.d/99-razer-hidraw.rules ] && [ -f udev/99-razer-hidraw
 	echo ""
 fi
 
+# The service races against /dev/uinput becoming usable at boot: the uinput
+# module only loads on the first successful open, and udev rules only apply
+# after the module loads. Loading the module early plus a static group grant
+# makes the service start first-try instead of after the first login.
+if [ ! -f /etc/modules-load.d/uinput.conf ]; then
+	echo ""
+	echo "For the service to start reliably at boot (root needed):"
+	echo "  echo uinput | sudo tee /etc/modules-load.d/uinput.conf"
+	echo ""
+fi
+if [ ! -f /etc/udev/rules.d/60-uinput.rules ] && [ -f udev/60-uinput.rules ]; then
+	echo ""
+	echo "And install the uinput access rule:"
+	echo "  sudo cp udev/60-uinput.rules /etc/udev/rules.d/"
+	echo "  sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=uinput"
+	echo ""
+fi
+
 echo "Wait a few seconds for the virtual devices to be created."
 sleep 5
 echo "Installation complete!"

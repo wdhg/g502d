@@ -1,0 +1,13 @@
+# Give the input group static access to /dev/uinput.
+#
+# The node is otherwise locked to root until the uinput module loads, and udev
+# rules only apply once it does - so user services that need uinput (moused,
+# elderbrain) deadlock at boot until the first login session grants an ACL.
+# A static group grant combined with loading the module early (see
+# /etc/modules-load.d/uinput.conf, installed by install.sh) makes access
+# deterministic from early boot.
+#
+# Install:
+#   sudo cp udev/60-uinput.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=uinput
+KERNEL=="uinput", SUBSYSTEM=="misc", MODE="0660", GROUP="input"

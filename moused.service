@@ -1,8 +1,16 @@
 [Unit]
 Description=Mouse Daemon
+# /dev/uinput is only usable once the uinput module is loaded, and udev rules
+# (including our 60-uinput.rules GROUP grant) only apply after that - so a
+# service starting at boot races against module load and session startup.
+# Wait for access, and restart as a backstop if the wait is lost anyway.
+# The real fix is /etc/modules-load.d/uinput.conf; see install.sh.
 
 [Service]
+ExecStartPre=/bin/sh -c 'i=0; until printf "" > /dev/uinput 2>/dev/null; do i=$((i+1)); [ $i -ge 150 ] && exit 1; sleep 2; done'
 ExecStart=%h/.local/bin/moused
+Restart=on-failure
+RestartSec=15
 StandardOutput=journal
 StandardError=journal
 
